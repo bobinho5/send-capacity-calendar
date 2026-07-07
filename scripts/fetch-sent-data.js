@@ -13,16 +13,9 @@ if (!TOKEN) {
 const BASE = 'https://api.hubapi.com';
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-function msDaysAgo(days) { const d = new Date(); d.setUTCDate(d.getUTCDate() - days); return d.getTime().toString(); }
-function nowMs() { return Date.now().toString(); }
-function dateKey(msString) { return new Date(parseInt(msString, 10)).toISOString().slice(0, 10); }
 
 async function hubspotFetch(url, options = {}, retries = 5) {
   for (let attempt = 0; attempt <= retries; attempt++) {
-    if (options.body) {
-      console.log('--- REQUEST BODY ---');
-      console.log(options.body);
-    }
     const res = await fetch(url, {
       ...options,
       headers: { 'Authorization': `Bearer ${TOKEN}`, 'Content-Type': 'application/json', ...(options.headers || {}) }
@@ -35,8 +28,6 @@ async function hubspotFetch(url, options = {}, retries = 5) {
     }
     if (!res.ok) {
       const text = await res.text();
-      console.log('--- FULL ERROR RESPONSE ---');
-      console.log(text);
       throw new Error(`HubSpot API error ${res.status}: ${text}`);
     }
     return res.json();
@@ -59,15 +50,17 @@ async function fetchAllOwners() {
   return owners;
 }
 
-async function fetchEmailsInRange(startMs, endMs) {
+// Fetch emails for a single, narrow time window (well under HubSpot's
+// 10,000-result-per-query cap).
+async function fetchEmailsForWindow(startMs, endMs) {
   const results = [];
   let after = undefined;
   do {
     const body = {
       filterGroups: [{
         filters: [
-          { propertyName: 'hs_timestamp', operator: 'GTE', value: startMs },
-          { propertyName: 'hs_timestamp', operator: 'LTE', value: endMs }
+          { propertyName: 'hs_timestamp', operator: 'GTE', value: startMs.toString() },
+          { propertyName: 'hs_timestamp', operator: 'LTE', value: endMs.toString() }
         ]
       }],
       properties: ['hubspot_owner_id', 'hs_timestamp', 'hs_email_direction', 'hs_email_status'],
@@ -80,9 +73,31 @@ async function fetchEmailsInRange(startMs, endMs) {
     });
     results.push(...data.results);
     after = data.paging && data.paging.next ? data.paging.next.after : undefined;
-    if (after) await sleep(400);
+    if (after) await sleep(350);
   } while (after);
   return results;
+}
+
+// HubSpot's search API caps total paginated results at 10,000 per query.
+// To stay safely under that, split the lookback period into one-day windows
+// and query each separately.
+async function fetchEmailsInRange(lookbackDays) {
+  const all = [];
+  const now = Date.now();
+  for (let i = lookbackDays; i >= 0; i--) {
+    const dayStart = new Date(now);
+    dayStart.setUTCDate(dayStart.getUTCDate() - i);
+    dayStart.setUTCHours(0, 0, 0, 0);
+    const dayEnd = new Date(dayStart);
+    dayEnd.setUTCHours(23, 59, 59, 999);
+
+    console.log(`Fetching ${dayStart.toISOString().slice(0, 10)}...`);
+    const dayResults = await fetchEmailsForWindow(dayStart.getTime(), Math.min(dayEnd.getTime(), now));
+    console.log(`  -> ${dayResults.length} email records`);
+    all.push(...dayResults);
+    await sleep(300);
+  }
+  return all;
 }
 
 async function main() {
@@ -93,10 +108,8 @@ async function main() {
     ownerMap[o.id] = [o.firstName, o.lastName].filter(Boolean).join(' ') || o.email || o.id;
   });
 
-  const start = msDaysAgo(LOOKBACK_DAYS);
-  const end = nowMs();
-  console.log(`Fetching emails from ${dateKey(start)} to ${dateKey(end)}...`);
-  const allEmails = await fetchEmailsInRange(start, end);
+  console.log(`Fetching emails across the last ${LOOKBACK_DAYS} days, one day at a time...`);
+  const allEmails = await fetchEmailsInRange(LOOKBACK_DAYS);
   console.log(`Fetched ${allEmails.length} total email records (before filtering to sent/outgoing).`);
 
   const sentEmails = allEmails.filter(e =>
