@@ -19,6 +19,10 @@ function dateKey(msString) { return new Date(parseInt(msString, 10)).toISOString
 
 async function hubspotFetch(url, options = {}, retries = 5) {
   for (let attempt = 0; attempt <= retries; attempt++) {
+    if (options.body) {
+      console.log('--- REQUEST BODY ---');
+      console.log(options.body);
+    }
     const res = await fetch(url, {
       ...options,
       headers: { 'Authorization': `Bearer ${TOKEN}`, 'Content-Type': 'application/json', ...(options.headers || {}) }
@@ -31,6 +35,8 @@ async function hubspotFetch(url, options = {}, retries = 5) {
     }
     if (!res.ok) {
       const text = await res.text();
+      console.log('--- FULL ERROR RESPONSE ---');
+      console.log(text);
       throw new Error(`HubSpot API error ${res.status}: ${text}`);
     }
     return res.json();
@@ -53,10 +59,6 @@ async function fetchAllOwners() {
   return owners;
 }
 
-// Only filter by timestamp via the API (reliably supported for engagement
-// objects). We filter direction/status ourselves afterward, since HubSpot's
-// search API appears not to support filtering emails by those enum
-// properties directly.
 async function fetchEmailsInRange(startMs, endMs) {
   const results = [];
   let after = undefined;
@@ -64,7 +66,8 @@ async function fetchEmailsInRange(startMs, endMs) {
     const body = {
       filterGroups: [{
         filters: [
-          { propertyName: 'hs_timestamp', operator: 'BETWEEN', value: startMs, highValue: endMs }
+          { propertyName: 'hs_timestamp', operator: 'GTE', value: startMs },
+          { propertyName: 'hs_timestamp', operator: 'LTE', value: endMs }
         ]
       }],
       properties: ['hubspot_owner_id', 'hs_timestamp', 'hs_email_direction', 'hs_email_status'],
