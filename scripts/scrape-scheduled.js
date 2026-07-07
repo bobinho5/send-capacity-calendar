@@ -1,14 +1,4 @@
 // scrape-scheduled.js
-//
-// Pulls forward-looking "next step" dates for in-progress sequence
-// enrollments, since HubSpot has no API for this. Verified against a real,
-// logged-in HubSpot session -- selectors are positional (HubSpot's CSS
-// classes are auto-generated hashes with no stable names), matched by
-// column order and parsed via regex on cell text.
-//
-// Requires env vars: HUBSPOT_SESSION_COOKIES (JSON array), HUBSPOT_PORTAL_ID
-// Writes: ../data/scheduled.json
-
 const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright');
@@ -24,9 +14,6 @@ if (!COOKIES_JSON || !PORTAL_ID) {
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-// HubSpot's app keeps background connections open constantly (notifications,
-// live updates), so 'networkidle' never resolves reliably. Wait for DOM
-// content instead, then give React a moment to hydrate/render.
 async function goAndSettle(page, url) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
   await sleep(1500);
@@ -80,7 +67,7 @@ async function scrapeSequenceEnrollments(page, sequenceId) {
     await nextBtn.click();
     await sleep(900);
     pageNum++;
-    if (pageNum > 200) break; // safety valve
+    if (pageNum > 200) break;
   }
   return rows;
 }
@@ -154,4 +141,12 @@ async function main() {
     rows: parsedRows
   };
 
-  const outPath = path.join(
+  const outPath = path.join(__dirname, '..', 'data', 'scheduled.json');
+  fs.writeFileSync(outPath, JSON.stringify(output, null, 2));
+  console.log(`Wrote ${outPath}`);
+}
+
+main().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
