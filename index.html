@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Send capacity calendar</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<style>
+  :root{
+    --bg:#161a22;
+    --panel:#1e2430;
+    --panel-2:#252c3a;
+    --line:#323b4d;
+    --text:#eef1f6;
+    --text-dim:#9aa3b8;
+    --text-faint:#6b7488;
+    --brand:#6c7bff;
+    --safe:#3ed6b5;
+    --warn:#f5a623;
+    --danger:#ff5d5d;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;padding:32px;min-height:100vh;}
+  .wrap{max-width:1160px;margin:0 auto;}
+  .top{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;flex-wrap:wrap;margin-bottom:24px;}
+  h1{font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:26px;margin:0 0 4px;letter-spacing:-0.01em;}
+  .sub{color:var(--text-dim);font-size:14px;margin:0;max-width:520px;line-height:1.5;}
+  .badge-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+  .badge{font-family:'IBM Plex Mono',monospace;font-size:12px;padding:6px 10px;border-radius:6px;border:1px solid var(--line);color:var(--text-dim);display:flex;align-items:center;gap:6px;}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--warn);flex:none;}
+  .dot.live{background:var(--safe);}
+  button{font-family:'Inter',sans-serif;font-weight:500;font-size:13px;cursor:pointer;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--text);padding:8px 14px;}
+  button:hover{border-color:var(--brand);}
+  button.primary{background:var(--brand);border-color:var(--brand);color:#0e1020;}
+  .controls{display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:20px;}
+  .field{display:flex;flex-direction:column;gap:4px;}
+  .field label{font-size:11px;color:var(--text-faint);text-transform:uppercase;letter-spacing:.06em;}
+  select, input[type=number]{font-family:'Inter',sans-serif;background:var(--panel-2);border:1px solid var(--line);color:var(--text);border-radius:6px;padding:7px 10px;font-size:13px;min-width:140px;}
+  input[type=number]{min-width:80px;font-family:'IBM Plex Mono',monospace;}
+  .viewtoggle{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-left:auto;}
+  .viewtoggle button{border:none;border-radius:0;background:transparent;}
+  .viewtoggle button.active{background:var(--brand);color:#0e1020;}
+  .spacer{flex:1;}
+  .monthnav{display:flex;align-items:center;gap:10px;margin-bottom:14px;}
+  .monthnav .label{font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:16px;min-width:160px;text-align:center;}
+  .cal{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;}
+  .calgrid{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;}
+  .dow{font-size:11px;color:var(--text-faint);text-align:center;padding-bottom:6px;text-transform:uppercase;letter-spacing:.06em;}
+  .day{background:var(--panel-2);border-radius:8px;padding:8px;min-height:82px;display:flex;flex-direction:column;justify-content:space-between;border:1px solid transparent;}
+  .day.empty{background:transparent;}
+  .day.today{border-color:var(--brand);}
+  .daynum{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text-faint);}
+  .daymetric{display:flex;align-items:center;gap:8px;}
+  .count{font-family:'IBM Plex Mono',monospace;font-size:16px;font-weight:600;}
+  .count.safe{color:var(--safe);}
+  .count.warn{color:var(--warn);}
+  .count.danger{color:var(--danger);}
+  .count.none{color:var(--text-faint);}
+  .count.projected{border-bottom:1px dashed currentColor;}
+  .pct{font-size:10px;color:var(--text-faint);font-family:'IBM Plex Mono',monospace;}
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  th{text-align:left;font-size:11px;color:var(--text-faint);text-transform:uppercase;padding:8px 10px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel);}
+  td{padding:8px 10px;border-bottom:1px solid var(--line);font-family:'IBM Plex Mono',monospace;}
+  .tablewrap{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:auto;max-height:560px;}
+  .legend{display:flex;gap:18px;align-items:center;margin-top:16px;flex-wrap:wrap;font-size:12px;color:var(--text-dim);}
+  .legenditem{display:flex;align-items:center;gap:6px;}
+  .sw{width:10px;height:10px;border-radius:3px;}
+  .note{margin-top:18px;font-size:12.5px;color:var(--text-faint);line-height:1.6;border-top:1px solid var(--line);padding-top:14px;}
+  .hidden{display:none !important;}
+  .tag-total{color:var(--text-dim);font-weight:600;}
+  .import{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:20px;}
+  .import-title{font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:15px;margin-bottom:4px;}
+  .import-desc{color:var(--text-dim);font-size:12.5px;margin:4px 0 12px;line-height:1.5;}
+  .import-status{font-size:12.5px;color:var(--text-faint);margin-top:10px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="top">
+    <div>
+      <h1>Send capacity calendar</h1>
+      <p class="sub">Daily HubSpot email volume by rep &mdash; synced automatically every morning by GitHub Actions.</p>
+    </div>
+    <div class="badge-row">
+      <span class="badge"><span class="dot" id="sentDot"></span><span id="sentLabel">Sent data: loading&hellip;</span></span>
+      <span class="badge"><span class="dot" id="schedDot"></span><span id="schedLabel">Scheduled data: loading&hellip;</span></span>
+    </div>
+  </div>
+
+  <div class="import">
+    <div class="import-title">Manual CSV override</div>
+    <p class="import-desc">The scraped scheduled-data file updates automatically, but if the scraper's selectors ever go stale (HubSpot changed their UI), drop a manual export here as a fallback.</p>
+    <input type="file" id="csvFile" accept=".csv">
+    <div class="import-status" id="importStatus"></div>
+  </div>
+
+  <div class="controls">
+    <div class="field">
+      <label>Account executive</label>
+      <select id="aeSelect"></select>
+    </div>
+    <div class="field">
+      <label>Daily limit per inbox</label>
+      <input type="number" id="limitInput" value="250" min="10" step="10">
+    </div>
+    <div class="spacer"></div>
+    <div class="viewtoggle">
+      <button id="viewCalBtn" class="active">Calendar</button>
+      <button id="viewTableBtn">Table</button>
+    </div>
+  </div>
+
+  <div id="calSection">
+    <div class="monthnav">
+      <button id="prevMonth">&larr;</button>
+      <div class="label" id="monthLabel"></div>
+      <button id="nextMonth">&rarr;</button>
+    </div>
+    <div class="cal"><div class="calgrid" id="calGrid"></div></div>
+  </div>
+
+  <div id="tableSection" class="hidden">
+    <div class="tablewrap">
+      <table><thead><tr id="tableHead"></tr></thead><tbody id="tableBody"></tbody></table>
+    </div>
+  </div>
+
+  <div class="legend">
+    <div class="legenditem"><span class="sw" style="background:var(--safe)"></span>Under 70% of limit</div>
+    <div class="legenditem"><span class="sw" style="background:var(--warn)"></span>70&ndash;99% of limit</div>
+    <div class="legenditem"><span class="sw" style="background:var(--danger)"></span>At or over limit</div>
+    <div class="legenditem"><span class="sw" style="background:var(--text-faint)"></span>No data</div>
+    <div class="legenditem"><span class="count projected" style="font-size:11px">123</span>Projected (scheduled)</div>
+  </div>
+
+  <div class="note" id="footnote"></div>
+
+</div>
+
+<script>
+const state = {
+  owners: [],
+  limit: 250,
+  selectedOwner: 'all',
+  view: 'calendar',
+  currentMonth: new Date(),
+  sends: {},
+  scheduledSends: {},
+  ownerNameMap: {},
+  sentMeta: null,
+  schedMeta: null
+};
+
+function pad(n){ return n.toString().padStart(2,'0'); }
+function toKey(d){ return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); }
+function todayKey(){ return toKey(new Date()); }
+function isFutureKey(key){ return key > todayKey(); }
+function normalizeName(s){ return (s||'').toString().trim().toLowerCase().replace(/\s+/g,' '); }
+
+function countFor(ownerId, key){
+  const source = isFutureKey(key) ? state.scheduledSends : state.sends;
+  const o = source[ownerId];
+  return (o && o[key]) || 0;
+}
+
+function aggregateForDate(key){
+  if(state.selectedOwner === 'all'){
+    let total = 0;
+    state.owners.forEach(o => { total += countFor(o.id, key); });
+    return total;
+  }
+  return countFor(state.selectedOwner, key);
+}
+
+function zone(count){
+  const pct = state.limit > 0 ? count / state.limit : 0;
+  if(count === 0) return 'none';
+  if(pct >= 1) return 'danger';
+  if(pct >= 0.7) return 'warn';
+  return 'safe';
+}
+function zoneColor(z){ return { safe:'#3ed6b5', warn:'#f5a623', danger:'#ff5d5d', none:'#3a4256' }[z]; }
+
+function ringSVG(count, limit, projected){
+  const pct = limit > 0 ? Math.min(count/limit, 1) : 0;
+  const color = zoneColor(zone(count));
+  const r = 14, c = 2*Math.PI*r, offset = c*(1-pct);
+  const outer = projected ? `<circle cx="17" cy="17" r="16.5" fill="none" stroke="${color}" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>` : '';
+  return `<svg width="34" height="34" viewBox="0 0 34 34">${outer}
+    <circle cx="17" cy="17" r="${r}" fill="none" stroke="#323b4d" stroke-width="4"/>
+    <circle cx="17" cy="17" r="${r}" fill="none" stroke="${color}" stroke-width="4" stroke-dasharray="${c}" stroke-dashoffset="${offset}" stroke-linecap="round" transform="rotate(-90 17 17)" opacity="${projected?0.75:1}"/>
+  </svg>`;
+}
+
+function renderAESelect(){
+  const sel = document.getElementById('aeSelect');
+  const current = state.selectedOwner;
+  sel.innerHTML = '<option value="all">All AEs (total)</option>' + state.owners.map(o => `<option value="${o.id}">${o.name}</option>`).join('');
+  sel.value = current;
+}
+
+function renderCalendar(){
+  const grid = document.getElementById('calGrid');
+  const month = state.currentMonth;
+  document.getElementById('monthLabel').textContent = month.toLocaleDateString(undefined,{month:'long',year:'numeric'});
+  const first = new Date(month.getFullYear(), month.getMonth(), 1);
+  const startDow = first.getDay();
+  const daysInMonth = new Date(month.getFullYear(), month.getMonth()+1, 0).getDate();
+  const tKey = todayKey();
+  let html = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d=>`<div class="dow">${d}</div>`).join('');
+  for(let i=0;i<startDow;i++) html += '<div class="day empty"></div>';
+  for(let day=1; day<=daysInMonth; day++){
+    const d = new Date(month.getFullYear(), month.getMonth(), day);
+    const key = toKey(d);
+    const count = aggregateForDate(key);
+    const z = zone(count);
+    const pct = state.limit>0 ? Math.round((count/state.limit)*100) : 0;
+    const future = isFutureKey(key);
+    const noData = future && Object.keys(state.scheduledSends).length===0;
+    html += `<div class="day${key===tKey?' today':''}">
+      <div class="daynum">${day}</div>
+      <div class="daymetric">
+        <div>${noData?'':ringSVG(count,state.limit,future)}</div>
+        <div>
+          <div class="count ${noData?'none':z}${future?' projected':''}">${noData?'&ndash;':count}</div>
+          <div class="pct">${noData?'no data':pct+'%'}</div>
+        </div>
+      </div>
+    </div>`;
+  }
+  grid.innerHTML = html;
+}
+
+function renderTable(){
+  const head = document.getElementById('tableHead');
+  const body = document.getElementById('tableBody');
+  const now = new Date();
+  const hasSchedule = Object.keys(state.scheduledSends).length>0;
+  const forwardDays = hasSchedule ? 21 : 0;
+  const dates = [];
+  for(let i=forwardDays;i>=-30;i--){ const d=new Date(now); d.setDate(d.getDate()+i); dates.push(d); }
+  dates.reverse();
+  if(state.selectedOwner==='all'){
+    head.innerHTML = '<th>Date</th>'+state.owners.map(o=>`<th>${o.name}</th>`).join('')+'<th class="tag-total">Total</th>';
+    body.innerHTML = dates.map(d=>{
+      const key=toKey(d), future=isFutureKey(key);
+      let total=0;
+      const cells = state.owners.map(o=>{ const c=countFor(o.id,key); total+=c; return `<td style="color:${zoneColor(zone(c))}">${c}</td>`; }).join('');
+      return `<tr><td>${d.toLocaleDateString(undefined,{month:'short',day:'numeric',weekday:'short'})}${future?' *':''}</td>${cells}<td class="tag-total" style="color:${zoneColor(zone(total))}">${total}</td></tr>`;
+    }).join('');
+  } else {
+    const name = state.owners.find(o=>o.id==state.selectedOwner)?.name || '';
+    head.innerHTML = `<th>Date</th><th>${name}</th><th>% of limit</th>`;
+    body.innerHTML = dates.map(d=>{
+      const key=toKey(d), future=isFutureKey(key);
+      const c = countFor(state.selectedOwner,key);
+      const pct = state.limit>0?Math.round((c/state.limit)*100):0;
+      return `<tr><td>${d.toLocaleDateString(undefined,{month:'short',day:'numeric',weekday:'short'})}${future?' *':''}</td><td style="color:${zoneColor(zone(c))}">${c}</td><td style="color:${zoneColor(zone(c))}">${pct}%</td></tr>`;
+    }).join('');
+  }
+}
+
+function renderAll(){
+  renderAESelect();
+  if(state.view==='calendar') renderCalendar(); else renderTable();
+  const sentDot = document.getElementById('sentDot');
+  const sentLabel = document.getElementById('sentLabel');
+  if(state.sentMeta && state.sentMeta.generatedAt){
+    sentDot.classList.add('live');
+    sentLabel.textContent = 'Sent data: synced ' + new Date(state.sentMeta.generatedAt).toLocaleString();
+  } else {
+    sentLabel.textContent = 'Sent data: not yet synced';
+  }
+  const schedDot = document.getElementById('schedDot');
+  const schedLabel = document.getElementById('schedLabel');
+  if(state.schedMeta && state.schedMeta.generatedAt && Object.keys(state.scheduledSends).length>0){
+    schedDot.classList.add('live');
+    schedLabel.textContent = 'Scheduled data: synced ' + new Date(state.schedMeta.generatedAt).toLocaleString();
+  } else {
+    schedLabel.textContent = 'Scheduled data: none yet \u2014 use manual CSV or check scraper';
+  }
+  document.getElementById('footnote').innerHTML =
+    'Past and today\u2019s counts come from HubSpot\u2019s real API, refreshed daily by a GitHub Action. Future dates (marked *) come from a scraped export of HubSpot\u2019s own Scheduled view, since no API exposes that data \u2014 treat those as best-effort projections, not guarantees.';
+}
+
+document.getElementById('aeSelect').addEventListener('change', e=>{ state.selectedOwner=e.target.value; renderAll(); });
+document.getElementById('limitInput').addEventListener('input', e=>{ state.limit=parseInt(e.target.value)||0; renderAll(); });
+document.getElementById('viewCalBtn').addEventListener('click', ()=>{
+  state.view='calendar';
+  document.getElementById('viewCalBtn').classList.add('active');
+  document.getElementById('viewTableBtn').classList.remove('active');
+  document.getElementById('calSection').classList.remove('hidden');
+  document.getElementById('tableSection').classList.add('hidden');
+  renderAll();
+});
+document.getElementById('viewTableBtn').addEventListener('click', ()=>{
+  state.view='table';
+  document.getElementById('viewTableBtn').classList.add('active');
+  document.getElementById('viewCalBtn').classList.remove('active');
+  document.getElementById('tableSection').classList.remove('hidden');
+  document.getElementById('calSection').classList.add('hidden');
+  renderAll();
+});
+document.getElementById('prevMonth').addEventListener('click', ()=>{ state.currentMonth.setMonth(state.currentMonth.getMonth()-1); state.currentMonth=new Date(state.currentMonth); renderCalendar(); });
+document.getElementById('nextMonth').addEventListener('click', ()=>{ state.currentMonth.setMonth(state.currentMonth.getMonth()+1); state.currentMonth=new Date(state.currentMonth); renderCalendar(); });
+
+function findOwnerByName(name){
+  const n = normalizeName(name);
+  if(state.ownerNameMap[n]) return state.ownerNameMap[n];
+  const match = state.owners.find(o => normalizeName(o.name)===n);
+  return match ? match.id : null;
+}
+
+document.getElementById('csvFile').addEventListener('change', e=>{
+  const file = e.target.files[0];
+  if(!file) return;
+  Papa.parse(file, {
+    header:true, skipEmptyLines:true,
+    complete: results=>{
+      const headers = results.meta.fields||[];
+      const repCol = headers.find(h=>/owner|rep|sender|enrolled by/i.test(h)) || headers[0];
+      const dateCol = headers.find(h=>/next|scheduled|send date|date/i.test(h)) || headers[1];
+      const counts = {};
+      let matched=0, unmatched=0;
+      results.data.forEach(row=>{
+        const ownerId = findOwnerByName(row[repCol]);
+        const d = new Date(row[dateCol]);
+        if(!ownerId || isNaN(d.getTime())){ unmatched++; return; }
+        const key = toKey(d);
+        counts[ownerId]=counts[ownerId]||{};
+        counts[ownerId][key]=(counts[ownerId][key]||0)+1;
+        matched++;
+      });
+      state.scheduledSends = counts;
+      state.schedMeta = { generatedAt: new Date().toISOString() };
+      document.getElementById('importStatus').textContent = `Imported ${matched} rows (${unmatched} skipped \u2014 unmatched rep name or unparseable date).`;
+      renderAll();
+    }
+  });
+});
+
+async function loadData(){
+  try{
+    const sentRes = await fetch('./data/sent.json', { cache: 'no-store' });
+    const sent = await sentRes.json();
+    state.owners = sent.owners || [];
+    state.sends = sent.sends || {};
+    state.sentMeta = { generatedAt: sent.generatedAt };
+  } catch(err){ console.error('Could not load sent.json', err); }
+
+  try{
+    const schedRes = await fetch('./data/scheduled.json', { cache: 'no-store' });
+    const sched = await schedRes.json();
+    if(sched.rows && sched.rows.length){
+      const counts = {};
+      sched.rows.forEach(r=>{
+        const ownerId = findOwnerByName(r.repName);
+        const d = new Date(r.sendDate);
+        if(!ownerId || isNaN(d.getTime())) return;
+        const key = toKey(d);
+        counts[ownerId]=counts[ownerId]||{};
+        counts[ownerId][key]=(counts[ownerId][key]||0)+1;
+      });
+      state.scheduledSends = counts;
+    }
+    state.schedMeta = { generatedAt: sched.generatedAt };
+  } catch(err){ console.error('Could not load scheduled.json', err); }
+
+  renderAll();
+}
+
+loadData();
+</script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+{
+  "name": "hubspot-send-calendar-sync",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "fetch-sent": "node fetch-sent-data.js",
+    "scrape-scheduled": "node scrape-scheduled.js"
+  },
+  "dependencies": {
+    "playwright": "^1.47.0"
+  }
+}
