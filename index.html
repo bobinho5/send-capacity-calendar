@@ -364,7 +364,7 @@ async function loadData(){
       const counts = {};
       sched.rows.forEach(r=>{
         const ownerId = findOwnerByName(r.repName);
-        const d = new Date(r.sendDate);
+         const d = parseISODateLocal(r.sendDate);
         if(!ownerId || isNaN(d.getTime())) return;
         const key = toKey(d);
         counts[ownerId]=counts[ownerId]||{};
