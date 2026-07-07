@@ -1,0 +1,56 @@
+name: Sync HubSpot send data
+
+on:
+  schedule:
+    # Runs at 06:00 UTC every day. Adjust to your team's timezone/needs.
+    - cron: '0 6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        working-directory: scripts
+        run: npm install
+
+      - name: Fetch sent-email data (HubSpot API)
+        working-directory: scripts
+        env:
+          HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
+          LOOKBACK_DAYS: '30'
+        run: node fetch-sent-data.js
+
+      - name: Install Playwright browsers
+        working-directory: scripts
+        run: npx playwright install --with-deps chromium
+
+      - name: Scrape scheduled-send data (HubSpot UI)
+        working-directory: scripts
+        env:
+          HUBSPOT_SESSION_COOKIES: ${{ secrets.HUBSPOT_SESSION_COOKIES }}
+          HUBSPOT_PORTAL_ID: ${{ secrets.HUBSPOT_PORTAL_ID }}
+        run: node scrape-scheduled.js
+        continue-on-error: true
+        # continue-on-error is deliberate: if the session cookie has expired
+        # or HubSpot changed their UI, we still want the sent-data half to
+        # commit successfully rather than failing the whole run.
+
+      - name: Commit updated data files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/sent.json data/scheduled.json
+          git diff --cached --quiet || git commit -m "Sync HubSpot data ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git push
