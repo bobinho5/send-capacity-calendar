@@ -1,31 +1,12 @@
 // scrape-scheduled.js
 //
-// Pulls the "Scheduled" sequence-send view from HubSpot's own UI, since
-// this data has no public API. Uses a saved, already-authenticated session
-// (cookies) rather than automating your login form — this deliberately
-// avoids scripting past 2FA or bot-detection on the login page itself.
+// Pulls forward-looking "next step" dates for in-progress sequence
+// enrollments, since HubSpot has no API for this. Verified against a real,
+// logged-in HubSpot session on 2026-07-07 -- selectors are positional
+// (HubSpot's CSS classes are auto-generated hashes with no stable names),
+// matched by column order and parsed via regex on cell text.
 //
-// ============================== IMPORTANT ==============================
-// This script is a STARTING TEMPLATE, not a verified, tested scraper.
-// I do not have a live HubSpot login to inspect the actual page structure
-// of the Sequences > Scheduled view, so the selectors below are best-effort
-// guesses based on common HubSpot UI patterns. You (or a follow-up session
-// using Claude in Chrome against your real, logged-in account) will very
-// likely need to open the Scheduled page, inspect the actual DOM, and
-// correct the selectors marked TODO below before this reliably works.
-// =========================================================================
-//
-// How to get the session cookie (do this yourself, don't share it with anyone):
-//   1. Log into HubSpot normally in Chrome.
-//   2. Open DevTools > Application > Cookies > https://app.hubspot.com
-//   3. Export the full cookie list as JSON (there are browser extensions
-//      for this, e.g. "Cookie-Editor" — use one you trust, or copy manually).
-//   4. Store that JSON as a GitHub Secret named HUBSPOT_SESSION_COOKIES.
-//   5. Repeat periodically when the session expires (HubSpot session
-//      cookies are typically valid for a few weeks).
-//
-// Requires env var: HUBSPOT_SESSION_COOKIES (JSON array of cookie objects)
-// Requires env var: HUBSPOT_PORTAL_ID (your numeric HubSpot account ID)
+// Requires env vars: HUBSPOT_SESSION_COOKIES (JSON array), HUBSPOT_PORTAL_ID
 // Writes: ../data/scheduled.json
 
 const fs = require('fs');
@@ -34,10 +15,70 @@ const { chromium } = require('playwright');
 
 const COOKIES_JSON = process.env.HUBSPOT_SESSION_COOKIES;
 const PORTAL_ID = process.env.HUBSPOT_PORTAL_ID;
+const MAX_SEQUENCES = parseInt(process.env.MAX_SEQUENCES || '150', 10);
 
 if (!COOKIES_JSON || !PORTAL_ID) {
   console.error('Missing HUBSPOT_SESSION_COOKIES or HUBSPOT_PORTAL_ID environment variable.');
   process.exit(1);
+}
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+async function getAllSequenceIds(page) {
+  const ids = [];
+  let pageNum = 1;
+  while (true) {
+    await page.goto(
+      `https://app.hubspot.com/sequences/${PORTAL_ID}/manage?field=updated_at&order=DESC&page=${pageNum}`,
+      { waitUntil: 'networkidle' }
+    );
+    const links = await page.$$eval('a[href*="/sequence/"]', as =>
+      as.map(a => {
+        const m = a.getAttribute('href').match(/\/sequence\/(\d+)/);
+        return m ? m[1] : null;
+      }).filter(Boolean)
+    );
+    if (links.length === 0) break;
+    ids.push(...links);
+    pageNum++;
+    if (ids.length >= MAX_SEQUENCES || pageNum > 50) break;
+    await sleep(300);
+  }
+  return [...new Set(ids)].slice(0, MAX_SEQUENCES);
+}
+
+async function scrapeSequenceEnrollments(page, sequenceId) {
+  const url = `https://app.hubspot.com/sequences/${PORTAL_ID}/sequence/${sequenceId}/enrollments/in-progress?enrolledBy=ALL_USERS`;
+  await page.goto(url, { waitUntil: 'networkidle' });
+  await sleep(800);
+
+  const rows = [];
+  let pageNum = 1;
+  while (true) {
+    const rowData = await page.$$eval('table tbody tr', trs =>
+      trs.map(tr => {
+        const cells = tr.querySelectorAll('td');
+        if (cells.length < 8) return null;
+        const enrolledText = cells[3].textContent.trim();
+        const detailsText = cells[7].textContent.trim();
+        const ownerMatch = enrolledText.match(/by (.+)$/);
+        const nextStepMatch = detailsText.match(/next step on (.+)$/i);
+        if (!ownerMatch || !nextStepMatch) return null;
+        return { repName: ownerMatch[1].trim(), nextStepText: nextStepMatch[1].trim() };
+      }).filter(Boolean)
+    );
+    rows.push(...rowData);
+
+    const nextBtn = await page.$('button[aria-label="Next"], a[aria-label="Next"]');
+    if (!nextBtn) break;
+    const isDisabled = await nextBtn.evaluate(el => el.disabled || el.getAttribute('aria-disabled') === 'true');
+    if (isDisabled) break;
+    await nextBtn.click();
+    await sleep(700);
+    pageNum++;
+    if (pageNum > 200) break; // safety valve
+  }
+  return rows;
 }
 
 async function main() {
@@ -47,57 +88,51 @@ async function main() {
   await context.addCookies(cookies);
   const page = await context.newPage();
 
-  const scheduledUrl = `https://app.hubspot.com/sequences/${PORTAL_ID}/scheduled`;
-  console.log(`Navigating to ${scheduledUrl}...`);
-  await page.goto(scheduledUrl, { waitUntil: 'networkidle' });
-
-  // TODO: verify this actually landed on the Scheduled tab and not a login
-  // redirect (cookie expired). A simple check: look for a known element
-  // that only exists when logged in.
-  const loggedIn = await page.locator('body').innerText().then(t => !t.includes('Log in'));
-  if (!loggedIn) {
-    throw new Error('Session cookie appears to be expired — re-export it from your browser.');
+  console.log('Checking session...');
+  await page.goto(`https://app.hubspot.com/sequences/${PORTAL_ID}/manage`, { waitUntil: 'networkidle' });
+  const bodyText = await page.textContent('body');
+  if (bodyText.includes('Sign in') || bodyText.includes('Log in')) {
+    throw new Error('Session cookie appears expired -- re-export it from your browser.');
   }
 
-  // TODO: HubSpot's Scheduled tab may have its own "Export" button rather
-  // than a plain table. If so, prefer clicking that and reading the
-  // downloaded file over scraping DOM rows directly — it will be far more
-  // reliable. Example pattern (adjust selector):
-  //
-  // const [download] = await Promise.all([
-  //   page.waitForEvent('download'),
-  //   page.click('button:has-text("Export")')
-  // ]);
-  // const downloadPath = await download.path();
-  // ... then parse the downloaded CSV instead of the DOM scrape below.
+  console.log('Listing sequences...');
+  const sequenceIds = await getAllSequenceIds(page);
+  console.log(`Found ${sequenceIds.length} sequences to check.`);
 
-  // Best-effort DOM scrape fallback if no export button is found:
-  const rows = await page.locator('[data-test-id="scheduled-email-row"]').all(); // TODO: real selector
-  const scheduled = [];
-  for (const row of rows) {
-    const repName = await row.locator('[data-test-id="row-owner"]').innerText().catch(() => null); // TODO
-    const sendDate = await row.locator('[data-test-id="row-next-send"]').innerText().catch(() => null); // TODO
-    if (repName && sendDate) {
-      scheduled.push({ repName: repName.trim(), sendDate: sendDate.trim() });
+  const allRows = [];
+  for (let i = 0; i < sequenceIds.length; i++) {
+    const id = sequenceIds[i];
+    try {
+      console.log(`[${i + 1}/${sequenceIds.length}] Checking sequence ${id}...`);
+      const rows = await scrapeSequenceEnrollments(page, id);
+      if (rows.length > 0) console.log(`  -> ${rows.length} in-progress enrollments`);
+      allRows.push(...rows);
+    } catch (err) {
+      console.log(`  -> skipped (${err.message})`);
     }
+    await sleep(400);
   }
 
-  console.log(`Scraped ${scheduled.length} scheduled-send rows.`);
+  const parsedRows = allRows.map(r => {
+    const d = new Date(r.nextStepText);
+    return {
+      repName: r.repName,
+      sendDate: isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10)
+    };
+  }).filter(r => r.sendDate);
+
+  console.log(`Total scheduled rows: ${parsedRows.length}`);
   await browser.close();
 
   const output = {
     generatedAt: new Date().toISOString(),
     source: 'scraped-ui',
-    rows: scheduled
+    rows: parsedRows
   };
 
   const outPath = path.join(__dirname, '..', 'data', 'scheduled.json');
   fs.writeFileSync(outPath, JSON.stringify(output, null, 2));
   console.log(`Wrote ${outPath}`);
-
-  if (scheduled.length === 0) {
-    console.warn('WARNING: 0 rows scraped. The selectors in this script almost certainly need updating — see TODOs at the top of scrape-scheduled.js.');
-  }
 }
 
 main().catch(err => {
