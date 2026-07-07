@@ -16,6 +16,10 @@ if (!TOKEN) {
 
 const BASE = 'https://api.hubapi.com';
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function msDaysAgo(days) {
   const d = new Date();
   d.setUTCDate(d.getUTCDate() - days);
@@ -30,20 +34,29 @@ function dateKey(msString) {
   return new Date(parseInt(msString, 10)).toISOString().slice(0, 10);
 }
 
-async function hubspotFetch(url, options = {}) {
-  const res = await fetch(url, {
-    ...options,
-    headers: {
-      'Authorization': `Bearer ${TOKEN}`,
-      'Content-Type': 'application/json',
-      ...(options.headers || {})
+async function hubspotFetch(url, options = {}, retries = 5) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch(url, {
+      ...options,
+      headers: {
+        'Authorization': `Bearer ${TOKEN}`,
+        'Content-Type': 'application/json',
+        ...(options.headers || {})
+      }
+    });
+    if (res.status === 429) {
+      const wait = 1500 * (attempt + 1);
+      console.log(`Rate limited, waiting ${wait}ms before retry ${attempt + 1}/${retries}...`);
+      await sleep(wait);
+      continue;
     }
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`HubSpot API error ${res.status}: ${text}`);
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`HubSpot API error ${res.status}: ${text}`);
+    }
+    return res.json();
   }
-  return res.json();
+  throw new Error('HubSpot API: exceeded retry attempts after repeated rate limiting.');
 }
 
 async function fetchAllOwners() {
@@ -56,6 +69,7 @@ async function fetchAllOwners() {
     const data = await hubspotFetch(url.toString());
     owners.push(...data.results.filter(o => !o.archived));
     after = data.paging && data.paging.next ? data.paging.next.after : undefined;
+    if (after) await sleep(400);
   } while (after);
   return owners;
 }
@@ -82,6 +96,7 @@ async function fetchSentEmails(startMs, endMs) {
     });
     results.push(...data.results);
     after = data.paging && data.paging.next ? data.paging.next.after : undefined;
+    if (after) await sleep(400);
   } while (after);
   return results;
 }
