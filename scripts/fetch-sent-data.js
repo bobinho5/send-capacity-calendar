@@ -1,8 +1,4 @@
 // fetch-sent-data.js
-//
-// Pulls real sent-email counts by owner and by day from HubSpot's public
-// CRM API, using a Private App access token (no scraping, no browser).
-
 const fs = require('fs');
 const path = require('path');
 
@@ -16,33 +12,16 @@ if (!TOKEN) {
 
 const BASE = 'https://api.hubapi.com';
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function msDaysAgo(days) {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() - days);
-  return d.getTime().toString();
-}
-
-function nowMs() {
-  return Date.now().toString();
-}
-
-function dateKey(msString) {
-  return new Date(parseInt(msString, 10)).toISOString().slice(0, 10);
-}
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function msDaysAgo(days) { const d = new Date(); d.setUTCDate(d.getUTCDate() - days); return d.getTime().toString(); }
+function nowMs() { return Date.now().toString(); }
+function dateKey(msString) { return new Date(parseInt(msString, 10)).toISOString().slice(0, 10); }
 
 async function hubspotFetch(url, options = {}, retries = 5) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     const res = await fetch(url, {
       ...options,
-      headers: {
-        'Authorization': `Bearer ${TOKEN}`,
-        'Content-Type': 'application/json',
-        ...(options.headers || {})
-      }
+      headers: { 'Authorization': `Bearer ${TOKEN}`, 'Content-Type': 'application/json', ...(options.headers || {}) }
     });
     if (res.status === 429) {
       const wait = 1500 * (attempt + 1);
@@ -74,19 +53,21 @@ async function fetchAllOwners() {
   return owners;
 }
 
-async function fetchSentEmails(startMs, endMs) {
+// Only filter by timestamp via the API (reliably supported for engagement
+// objects). We filter direction/status ourselves afterward, since HubSpot's
+// search API appears not to support filtering emails by those enum
+// properties directly.
+async function fetchEmailsInRange(startMs, endMs) {
   const results = [];
   let after = undefined;
   do {
     const body = {
       filterGroups: [{
         filters: [
-          { propertyName: 'hs_email_direction', operator: 'EQ', value: 'EMAIL' },
-          { propertyName: 'hs_email_status', operator: 'EQ', value: 'SENT' },
           { propertyName: 'hs_timestamp', operator: 'BETWEEN', value: startMs, highValue: endMs }
         ]
       }],
-      properties: ['hubspot_owner_id', 'hs_timestamp'],
+      properties: ['hubspot_owner_id', 'hs_timestamp', 'hs_email_direction', 'hs_email_status'],
       limit: 100,
       ...(after ? { after } : {})
     };
@@ -111,12 +92,18 @@ async function main() {
 
   const start = msDaysAgo(LOOKBACK_DAYS);
   const end = nowMs();
-  console.log(`Fetching sent emails from ${dateKey(start)} to ${dateKey(end)}...`);
-  const emails = await fetchSentEmails(start, end);
-  console.log(`Fetched ${emails.length} sent-email records.`);
+  console.log(`Fetching emails from ${dateKey(start)} to ${dateKey(end)}...`);
+  const allEmails = await fetchEmailsInRange(start, end);
+  console.log(`Fetched ${allEmails.length} total email records (before filtering to sent/outgoing).`);
+
+  const sentEmails = allEmails.filter(e =>
+    e.properties.hs_email_direction === 'EMAIL' &&
+    e.properties.hs_email_status === 'SENT'
+  );
+  console.log(`${sentEmails.length} are outgoing + sent.`);
 
   const counts = {};
-  emails.forEach(e => {
+  sentEmails.forEach(e => {
     const ownerId = e.properties.hubspot_owner_id;
     const ts = e.properties.hs_timestamp;
     if (!ownerId || !ts) return;
