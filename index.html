@@ -333,7 +333,7 @@ document.getElementById('csvFile').addEventListener('change', e=>{
       let matched=0, unmatched=0;
       results.data.forEach(row=>{
         const ownerId = findOwnerByName(row[repCol]);
-        const d = new Date(row[dateCol]);
+        const d = parseISODateLocal(row[dateCol]);
         if(!ownerId || isNaN(d.getTime())){ unmatched++; return; }
         const key = toKey(d);
         counts[ownerId]=counts[ownerId]||{};
