@@ -60,7 +60,7 @@ async function scrapeSequenceEnrollments(page, sequenceId) {
     );
     rows.push(...rowData);
 
-    const nextBtn = await page.$('button[aria-label="Next"], a[aria-label="Next"]');
+    const nextBtn = await page.$('button[aria-label="Next page"], a[aria-label="Next page"]');
     if (!nextBtn) break;
     const isDisabled = await nextBtn.evaluate(el => el.disabled || el.getAttribute('aria-disabled') === 'true');
     if (isDisabled) break;
