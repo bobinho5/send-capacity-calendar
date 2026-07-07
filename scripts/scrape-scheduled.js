@@ -113,8 +113,9 @@ async function main() {
 
   console.log('Checking session...');
   await page.goto(`https://app.hubspot.com/sequences/${PORTAL_ID}/manage`, { waitUntil: 'networkidle' });
-  const bodyText = await page.textContent('body');
-  if (bodyText.includes('Sign in') || bodyText.includes('Log in')) {
+  const currentUrl = page.url();
+  console.log('Landed on:', currentUrl);
+  if (currentUrl.includes('/login')) {
     throw new Error('Session cookie appears expired -- re-export it from your browser.');
   }
 
