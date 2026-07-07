@@ -2,9 +2,9 @@
 //
 // Pulls forward-looking "next step" dates for in-progress sequence
 // enrollments, since HubSpot has no API for this. Verified against a real,
-// logged-in HubSpot session on 2026-07-07 -- selectors are positional
-// (HubSpot's CSS classes are auto-generated hashes with no stable names),
-// matched by column order and parsed via regex on cell text.
+// logged-in HubSpot session -- selectors are positional (HubSpot's CSS
+// classes are auto-generated hashes with no stable names), matched by
+// column order and parsed via regex on cell text.
 //
 // Requires env vars: HUBSPOT_SESSION_COOKIES (JSON array), HUBSPOT_PORTAL_ID
 // Writes: ../data/scheduled.json
@@ -24,14 +24,19 @@ if (!COOKIES_JSON || !PORTAL_ID) {
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
+// HubSpot's app keeps background connections open constantly (notifications,
+// live updates), so 'networkidle' never resolves reliably. Wait for DOM
+// content instead, then give React a moment to hydrate/render.
+async function goAndSettle(page, url) {
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await sleep(1500);
+}
+
 async function getAllSequenceIds(page) {
   const ids = [];
   let pageNum = 1;
   while (true) {
-    await page.goto(
-      `https://app.hubspot.com/sequences/${PORTAL_ID}/manage?field=updated_at&order=DESC&page=${pageNum}`,
-      { waitUntil: 'networkidle' }
-    );
+    await goAndSettle(page, `https://app.hubspot.com/sequences/${PORTAL_ID}/manage?field=updated_at&order=DESC&page=${pageNum}`);
     const links = await page.$$eval('a[href*="/sequence/"]', as =>
       as.map(a => {
         const m = a.getAttribute('href').match(/\/sequence\/(\d+)/);
@@ -49,8 +54,7 @@ async function getAllSequenceIds(page) {
 
 async function scrapeSequenceEnrollments(page, sequenceId) {
   const url = `https://app.hubspot.com/sequences/${PORTAL_ID}/sequence/${sequenceId}/enrollments/in-progress?enrolledBy=ALL_USERS`;
-  await page.goto(url, { waitUntil: 'networkidle' });
-  await sleep(800);
+  await goAndSettle(page, url);
 
   const rows = [];
   let pageNum = 1;
@@ -74,7 +78,7 @@ async function scrapeSequenceEnrollments(page, sequenceId) {
     const isDisabled = await nextBtn.evaluate(el => el.disabled || el.getAttribute('aria-disabled') === 'true');
     if (isDisabled) break;
     await nextBtn.click();
-    await sleep(700);
+    await sleep(900);
     pageNum++;
     if (pageNum > 200) break; // safety valve
   }
@@ -84,9 +88,6 @@ async function scrapeSequenceEnrollments(page, sequenceId) {
 async function main() {
   const rawCookies = JSON.parse(COOKIES_JSON);
 
-  // Cookie-Editor's export format doesn't exactly match what Playwright
-  // expects (different sameSite naming, different expiry field name).
-  // Normalize each cookie here.
   const cookies = rawCookies.map(c => {
     let sameSite = 'Lax';
     const s = (c.sameSite || '').toLowerCase();
@@ -100,7 +101,6 @@ async function main() {
       path: c.path || '/',
       expires: c.expirationDate ? Math.floor(c.expirationDate) : undefined,
       httpOnly: !!c.httpOnly,
-      // Chrome requires secure:true whenever sameSite is 'None'
       secure: sameSite === 'None' ? true : !!c.secure,
       sameSite
     };
@@ -112,7 +112,7 @@ async function main() {
   const page = await context.newPage();
 
   console.log('Checking session...');
-  await page.goto(`https://app.hubspot.com/sequences/${PORTAL_ID}/manage`, { waitUntil: 'networkidle' });
+  await goAndSettle(page, `https://app.hubspot.com/sequences/${PORTAL_ID}/manage`);
   const currentUrl = page.url();
   console.log('Landed on:', currentUrl);
   if (currentUrl.includes('/login')) {
@@ -154,12 +154,4 @@ async function main() {
     rows: parsedRows
   };
 
-  const outPath = path.join(__dirname, '..', 'data', 'scheduled.json');
-  fs.writeFileSync(outPath, JSON.stringify(output, null, 2));
-  console.log(`Wrote ${outPath}`);
-}
-
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+  const outPath = path.join(
