@@ -155,14 +155,16 @@ const state = {
 };
 
 function pad(n){ return n.toString().padStart(2,'0'); }
+function toKey(d){ return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); }
+function todayKey(){ return toKey(new Date()); }
 // Bare "YYYY-MM-DD" strings get parsed by JS as UTC midnight, which can
-   // roll back a day once converted to local time. Parse these manually as
-   // local dates instead to avoid that shift.
-   function parseISODateLocal(str){
-     const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(str);
-     if (m) return new Date(parseInt(m[1],10), parseInt(m[2],10)-1, parseInt(m[3],10));
-     return new Date(str);
-   }
+// roll back a day once converted to local time. Parse these manually as
+// local dates instead to avoid that shift.
+function parseISODateLocal(str){
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(str);
+  if (m) return new Date(parseInt(m[1],10), parseInt(m[2],10)-1, parseInt(m[3],10));
+  return new Date(str);
+}
 function isFutureKey(key){ return key > todayKey(); }
 function normalizeName(s){ return (s||'').toString().trim().toLowerCase().replace(/\s+/g,' '); }
 
@@ -364,7 +366,7 @@ async function loadData(){
       const counts = {};
       sched.rows.forEach(r=>{
         const ownerId = findOwnerByName(r.repName);
-         const d = parseISODateLocal(r.sendDate);
+        const d = parseISODateLocal(r.sendDate);
         if(!ownerId || isNaN(d.getTime())) return;
         const key = toKey(d);
         counts[ownerId]=counts[ownerId]||{};
