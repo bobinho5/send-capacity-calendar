@@ -82,7 +82,30 @@ async function scrapeSequenceEnrollments(page, sequenceId) {
 }
 
 async function main() {
-  const cookies = JSON.parse(COOKIES_JSON);
+  const rawCookies = JSON.parse(COOKIES_JSON);
+
+  // Cookie-Editor's export format doesn't exactly match what Playwright
+  // expects (different sameSite naming, different expiry field name).
+  // Normalize each cookie here.
+  const cookies = rawCookies.map(c => {
+    let sameSite = 'Lax';
+    const s = (c.sameSite || '').toLowerCase();
+    if (s === 'no_restriction' || s === 'none') sameSite = 'None';
+    else if (s === 'strict') sameSite = 'Strict';
+
+    return {
+      name: c.name,
+      value: c.value,
+      domain: c.domain,
+      path: c.path || '/',
+      expires: c.expirationDate ? Math.floor(c.expirationDate) : undefined,
+      httpOnly: !!c.httpOnly,
+      // Chrome requires secure:true whenever sameSite is 'None'
+      secure: sameSite === 'None' ? true : !!c.secure,
+      sameSite
+    };
+  });
+
   const browser = await chromium.launch();
   const context = await browser.newContext();
   await context.addCookies(cookies);
