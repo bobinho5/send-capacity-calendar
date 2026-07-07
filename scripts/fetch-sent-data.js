@@ -2,18 +2,6 @@
 //
 // Pulls real sent-email counts by owner and by day from HubSpot's public
 // CRM API, using a Private App access token (no scraping, no browser).
-//
-// Requires env var: HUBSPOT_TOKEN
-// Writes: ../data/sent.json
-//
-// HubSpot API docs referenced:
-//   Search emails:  POST https://api.hubapi.com/crm/v3/objects/emails/search
-//   List owners:    GET  https://api.hubapi.com/crm/v3/owners
-//
-// NOTE: property names (hs_email_direction, hs_email_status, hs_timestamp,
-// hubspot_owner_id) match HubSpot's default one-to-one email engagement
-// schema as of this writing. If your portal has renamed or removed any of
-// these, check Settings > Properties > Email in HubSpot and adjust below.
 
 const fs = require('fs');
 const path = require('path');
@@ -28,14 +16,18 @@ if (!TOKEN) {
 
 const BASE = 'https://api.hubapi.com';
 
-function isoDateDaysAgo(days) {
+function msDaysAgo(days) {
   const d = new Date();
   d.setUTCDate(d.getUTCDate() - days);
-  return d.toISOString();
+  return d.getTime().toString();
 }
 
-function dateKey(isoString) {
-  return isoString.slice(0, 10); // YYYY-MM-DD
+function nowMs() {
+  return Date.now().toString();
+}
+
+function dateKey(msString) {
+  return new Date(parseInt(msString, 10)).toISOString().slice(0, 10);
 }
 
 async function hubspotFetch(url, options = {}) {
@@ -68,7 +60,7 @@ async function fetchAllOwners() {
   return owners;
 }
 
-async function fetchSentEmails(startIso, endIso) {
+async function fetchSentEmails(startMs, endMs) {
   const results = [];
   let after = undefined;
   do {
@@ -77,7 +69,7 @@ async function fetchSentEmails(startIso, endIso) {
         filters: [
           { propertyName: 'hs_email_direction', operator: 'EQ', value: 'EMAIL' },
           { propertyName: 'hs_email_status', operator: 'EQ', value: 'SENT' },
-          { propertyName: 'hs_timestamp', operator: 'BETWEEN', value: startIso, highValue: endIso }
+          { propertyName: 'hs_timestamp', operator: 'BETWEEN', value: startMs, highValue: endMs }
         ]
       }],
       properties: ['hubspot_owner_id', 'hs_timestamp'],
@@ -102,9 +94,9 @@ async function main() {
     ownerMap[o.id] = [o.firstName, o.lastName].filter(Boolean).join(' ') || o.email || o.id;
   });
 
-  const start = isoDateDaysAgo(LOOKBACK_DAYS);
-  const end = new Date().toISOString();
-  console.log(`Fetching sent emails from ${start} to ${end}...`);
+  const start = msDaysAgo(LOOKBACK_DAYS);
+  const end = nowMs();
+  console.log(`Fetching sent emails from ${dateKey(start)} to ${dateKey(end)}...`);
   const emails = await fetchSentEmails(start, end);
   console.log(`Fetched ${emails.length} sent-email records.`);
 
@@ -113,7 +105,7 @@ async function main() {
     const ownerId = e.properties.hubspot_owner_id;
     const ts = e.properties.hs_timestamp;
     if (!ownerId || !ts) return;
-    const key = dateKey(ts);
+    const key = new Date(ts).toISOString().slice(0, 10);
     counts[ownerId] = counts[ownerId] || {};
     counts[ownerId][key] = (counts[ownerId][key] || 0) + 1;
   });
