@@ -354,7 +354,7 @@ async function loadData(){
   try{
     const sentRes = await fetch('./data/sent.json', { cache: 'no-store' });
     const sent = await sentRes.json();
-    state.owners = sent.owners || [];
+    state.owners = (sent.owners || []).sort((a, b) => a.name.localeCompare(b.name));
     state.sends = sent.sends || {};
     state.sentMeta = { generatedAt: sent.generatedAt };
   } catch(err){ console.error('Could not load sent.json', err); }
