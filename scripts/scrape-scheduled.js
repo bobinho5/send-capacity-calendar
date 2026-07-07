@@ -4,13 +4,10 @@
 // enrollments. HubSpot has no API for this, so it's scraped from the
 // Sequences UI using a saved session cookie.
 //
-// IMPORTANT: this version projects the FULL remaining chain of email steps
-// for each contact, not just the immediate next step. Each sequence's Steps
-// tab labels every step with a cumulative business-day offset (e.g. "3.
-// Automated Email - Day 3"). Combined with the one calendar date we know
-// for certain (the contact's immediate next-step date, shown in the
-// Enrollments table), we can project every later email step's calendar
-// date by adding the business-day difference between offsets.
+// This version projects the FULL remaining chain of email steps for each
+// contact (not just the immediate next step), always includes a fixed list
+// of "must check" sequences, and always includes any sequence whose name
+// contains "inbound" regardless of how recently it was modified.
 //
 // Requires env vars: HUBSPOT_SESSION_COOKIES (JSON array), HUBSPOT_PORTAL_ID
 // Optional env vars: MAX_SEQUENCES (default 50), FORCE_SEQUENCE_IDS
@@ -39,7 +36,6 @@ async function goAndSettle(page, url) {
   await sleep(1500);
 }
 
-// Add N business days (Mon-Fri) to a date, skipping weekends.
 function addBusinessDays(date, n) {
   const d = new Date(date);
   let added = 0;
@@ -54,31 +50,36 @@ function addBusinessDays(date, n) {
 }
 
 async function getAllSequenceIds(page) {
-  const ids = [];
+  const topIds = [];
+  const inboundIds = [];
+  let doneCollectingTop = false;
   let pageNum = 1;
   while (true) {
     await goAndSettle(page, `https://app.hubspot.com/sequences/${PORTAL_ID}/manage?field=updated_at&order=DESC&page=${pageNum}`);
-    const links = await page.$$eval('a[href*="/sequence/"]', as =>
+    const rows = await page.$$eval('a[href*="/sequence/"]', as =>
       as.map(a => {
         const m = a.getAttribute('href').match(/\/sequence\/(\d+)/);
-        return m ? m[1] : null;
+        return m ? { id: m[1], name: a.textContent.trim() } : null;
       }).filter(Boolean)
     );
-    if (links.length === 0) break;
-    ids.push(...links);
+    if (rows.length === 0) break;
+    rows.forEach(r => {
+      if (!doneCollectingTop) topIds.push(r.id);
+      if (/inbound/i.test(r.name)) inboundIds.push(r.id);
+    });
+    if (topIds.length >= MAX_SEQUENCES) doneCollectingTop = true;
     pageNum++;
-    if (ids.length >= MAX_SEQUENCES || pageNum > 50) break;
+    if (pageNum > 50) break;
     await sleep(300);
   }
-  const topIds = [...new Set(ids)].slice(0, MAX_SEQUENCES);
-  FORCE_SEQUENCE_IDS.forEach(id => {
-    if (!topIds.includes(id)) topIds.push(id);
-  });
-  return topIds;
+  console.log(`Inbound-named sequences found: ${inboundIds.length}`);
+  return [...new Set([
+    ...topIds.slice(0, MAX_SEQUENCES),
+    ...FORCE_SEQUENCE_IDS,
+    ...inboundIds
+  ])];
 }
 
-// Scrapes a sequence's Steps tab and returns { stepNumber, isEmail, dayOffset }
-// for every step.
 async function getStepMap(page, sequenceId) {
   await goAndSettle(page, `https://app.hubspot.com/sequences/${PORTAL_ID}/sequence/${sequenceId}/edit`);
   const stepTexts = await page.evaluate(() => {
@@ -139,7 +140,6 @@ async function scrapeEnrollmentRows(page, sequenceId) {
   return rows;
 }
 
-// Projects every remaining email-send date for a contact.
 function projectEmailDates(contactRow, stepMap) {
   const { nextStepNum, totalSteps, nextStepText } = contactRow;
   const anchorDate = new Date(nextStepText);
@@ -189,7 +189,7 @@ async function main() {
 
   console.log('Listing sequences...');
   const sequenceIds = await getAllSequenceIds(page);
-  console.log(`Found ${sequenceIds.length} sequences to check (including forced: ${FORCE_SEQUENCE_IDS.join(', ')}).`);
+  console.log(`Found ${sequenceIds.length} sequences to check (including forced: ${FORCE_SEQUENCE_IDS.join(', ')}, plus any "inbound"-named sequences).`);
 
   const finalRows = [];
   for (let i = 0; i < sequenceIds.length; i++) {
