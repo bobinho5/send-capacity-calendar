@@ -6,23 +6,25 @@
 // already partway through ("In progress" status). HubSpot has no API for
 // this, so it's scraped from the Sequences UI using a saved session cookie.
 //
-// SEQUENCE DISCOVERY -- scoped to a fixed, known list of AEs rather than
-// sweeping the entire account. This is both faster and more accurate,
-// since we only care about capacity for reps who actually matter here.
-//   1. Every sequence owned by anyone on AE_NAMES.
-//   2. Every sequence owned by BOBBY_MOHR_NAME -- he's a template/admin
-//      owner whose sequences other real AEs enroll contacts into (e.g.
-//      "THSCA Template FB/S&C/AD 2026"), so his sequences need checking
-//      even though he's not himself an AE we're monitoring.
-//   3. Any sequence whose name contains "inbound", found via a direct
-//      Manage-list search (?q=inbound) rather than a full sweep.
+// SEQUENCE DISCOVERY -- scoped to a fixed, known list of AEs, with a hard
+// cap on how many of their sequences actually get checked in detail:
+//   1. Pool every sequence owned by anyone on AE_NAMES, or by
+//      TEMPLATE_OWNER_NAME (Bobby Mohr owns template sequences that real
+//      AEs enroll contacts into, e.g. "THSCA Template FB/S&C/AD 2026",
+//      even though he's not an AE himself).
+//   2. From that pool, take the top MAX_RECENT most recently modified.
+//   3. From whatever's left over, take the top MAX_EXTRA_HIGH_VOLUME more
+//      by total-enrolled count. This is the guardrail against an owner
+//      (typically Bobby Mohr) sitting on hundreds of old template
+//      sequences that would otherwise all get checked one by one.
+//   4. Any sequence whose name contains "inbound" (direct ?q=inbound
+//      search, independent of the owner pool/cap above).
 // Plus any explicitly forced IDs (FORCE_SEQUENCE_IDS).
 //
 // IMPORTANT: which AE a future email gets attributed to is NEVER based on
 // sequence ownership -- it's read per-contact from the "Enrolled ... by
-// <name>" text on each row. So even on a sequence owned by Bobby Mohr,
-// a contact enrolled by Mathew Young is correctly attributed to Mathew
-// Young. Ownership only affects which sequences we bother checking.
+// <name>" text on each row. Ownership only affects which sequences we
+// bother checking, not who a projected send gets credited to.
 //
 // For each contact we know one certain calendar date -- either their
 // enrollment's first send date (Scheduled) or their immediate next-step
@@ -36,7 +38,8 @@
 // trusting a fixed sleep.
 //
 // Requires env vars: HUBSPOT_SESSION_COOKIES (JSON array), HUBSPOT_PORTAL_ID
-// Optional env vars: FORCE_SEQUENCE_IDS
+// Optional env vars: FORCE_SEQUENCE_IDS, MAX_RECENT (default 50),
+//   MAX_EXTRA_HIGH_VOLUME (default 10)
 // Writes: ../data/scheduled.json
 
 const fs = require('fs');
@@ -45,6 +48,8 @@ const { chromium } = require('playwright');
 
 const COOKIES_JSON = process.env.HUBSPOT_SESSION_COOKIES;
 const PORTAL_ID = process.env.HUBSPOT_PORTAL_ID;
+const MAX_RECENT = parseInt(process.env.MAX_RECENT || '50', 10);
+const MAX_EXTRA_HIGH_VOLUME = parseInt(process.env.MAX_EXTRA_HIGH_VOLUME || '10', 10);
 const FORCE_SEQUENCE_IDS = (process.env.FORCE_SEQUENCE_IDS || '272570396,76707862,307480679,307295410')
   .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -108,6 +113,21 @@ function addBusinessDays(date, n) {
   return d;
 }
 
+function approxDaysAgo(text) {
+  if (!text) return 999999;
+  const t = text.toLowerCase().trim();
+  if (/just now|minute|hour/.test(t)) return 0;
+  const m = t.match(/(a|an|\d+)\s+(day|week|month|year)/);
+  if (!m) return 999999;
+  const n = m[1] === 'a' || m[1] === 'an' ? 1 : parseInt(m[1], 10);
+  const unit = m[2];
+  if (unit === 'day') return n;
+  if (unit === 'week') return n * 7;
+  if (unit === 'month') return n * 30;
+  if (unit === 'year') return n * 365;
+  return 999999;
+}
+
 async function setPageSizeTo100(page) {
   try {
     const menuBtn = page.locator('button:has-text("per page")').first();
@@ -124,7 +144,23 @@ async function setPageSizeTo100(page) {
   }
 }
 
-async function readManageRows(page) {
+async function readManageRowsDetailed(page) {
+  return page.$$eval('table tbody tr', trs =>
+    trs.map(tr => {
+      const link = tr.querySelector('a[href*="/sequence/"]');
+      if (!link) return null;
+      const m = link.getAttribute('href').match(/\/sequence\/(\d+)/);
+      if (!m) return null;
+      const cells = tr.querySelectorAll('td');
+      const enrolledText = cells[2] ? cells[2].textContent.trim() : '0';
+      const enrolledCount = parseInt(enrolledText.replace(/,/g, ''), 10) || 0;
+      const dateModifiedText = cells[6] ? cells[6].textContent.trim() : '';
+      return { id: m[1], name: link.textContent.trim(), enrolledCount, dateModifiedText };
+    }).filter(Boolean)
+  );
+}
+
+async function readManageRowsSimple(page) {
   return page.$$eval('table tbody tr', trs =>
     trs.map(tr => {
       const link = tr.querySelector('a[href*="/sequence/"]');
@@ -142,7 +178,7 @@ async function searchSequencesByName(page, term) {
   while (true) {
     await goAndSettle(page, `https://app.hubspot.com/sequences/${PORTAL_ID}/manage?q=${encodeURIComponent(term)}&page=${pageNum}`);
     await waitForManageRowsToLoad(page, 5000);
-    const rows = await readManageRows(page);
+    const rows = await readManageRowsSimple(page);
     if (rows.length === 0) break;
     results.push(...rows);
     const nextBtn = await page.$('button[aria-label="Next page"], a[aria-label="Next page"]');
@@ -190,7 +226,7 @@ async function sweepByOwner(page, ownerName) {
   let pageNum = 1;
   while (true) {
     await waitForManageRowsToLoad(page);
-    const pageRows = await readManageRows(page);
+    const pageRows = await readManageRowsDetailed(page);
     if (pageRows.length === 0) break;
     rows.push(...pageRows);
 
@@ -346,24 +382,37 @@ async function main() {
   const inboundResults = await searchSequencesByName(page, 'inbound');
   console.log(`Found ${inboundResults.length} inbound-named sequences.`);
 
+  console.log('Pooling sequences owned by the AE roster + Bobby Mohr...');
   const ownersToSweep = [...AE_NAMES, TEMPLATE_OWNER_NAME];
-  const ownerSweepIds = [];
+  const pool = new Map();
   for (let i = 0; i < ownersToSweep.length; i++) {
     const ownerName = ownersToSweep[i];
     try {
       const rows = await sweepByOwner(page, ownerName);
-      ownerSweepIds.push(...rows.map(r => r.id));
+      rows.forEach(r => pool.set(r.id, r));
       console.log(`  [${i + 1}/${ownersToSweep.length}] ${ownerName}: ${rows.length} sequences owned`);
     } catch (err) {
       console.log(`  [${i + 1}/${ownersToSweep.length}] ${ownerName}: skipped (${err.message})`);
     }
     await sleep(300);
   }
+  const poolArr = [...pool.values()];
+  console.log(`Owner pool: ${poolArr.length} distinct sequences before applying recency/volume caps.`);
+
+  const byRecency = [...poolArr].sort((a, b) => approxDaysAgo(a.dateModifiedText) - approxDaysAgo(b.dateModifiedText));
+  const recentSet = byRecency.slice(0, MAX_RECENT);
+  const recentIds = new Set(recentSet.map(r => r.id));
+
+  const remaining = poolArr.filter(r => !recentIds.has(r.id));
+  const byVolume = remaining.sort((a, b) => b.enrolledCount - a.enrolledCount).slice(0, MAX_EXTRA_HIGH_VOLUME);
+
+  console.log(`Capped to ${recentSet.length} most-recent + ${byVolume.length} additional high-volume = ${recentSet.length + byVolume.length} sequences from the owner pool.`);
 
   const sequenceIds = [...new Set([
     ...FORCE_SEQUENCE_IDS,
     ...inboundResults.map(r => r.id),
-    ...ownerSweepIds
+    ...recentSet.map(r => r.id),
+    ...byVolume.map(r => r.id)
   ])];
   console.log(`Found ${sequenceIds.length} total sequences to check in detail.`);
 
