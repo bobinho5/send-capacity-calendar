@@ -6,19 +6,23 @@
 // already partway through ("In progress" status). HubSpot has no API for
 // this, so it's scraped from the Sequences UI using a saved session cookie.
 //
-// SEQUENCE DISCOVERY (three combined sources, since HubSpot's Manage list
-// hits a real pagination ceiling around ~360 of a 498-sequence account):
-//   1. A flat sweep of the default (stable, alphabetical) Manage list, up
-//      to wherever it caps out. Collects inbound-name and high-volume
-//      matches, plus every distinct owner name seen along the way.
-//   2. Owner names pulled from ../data/sent.json (written by the sibling
-//      fetch-sent-data.js script earlier in the same job).
-//   3. For every distinct owner name from (1) and (2), we look up their
-//      internal "view" ID via the Manage list's owner search box, then
-//      sweep THEIR filtered sequence list specifically. Since any single
-//      rep's sequence count is far below the pagination ceiling, this
-//      reaches sequences the flat sweep alone could never see.
-// All matches are unioned with explicitly forced IDs (FORCE_SEQUENCE_IDS).
+// SEQUENCE DISCOVERY -- scoped to a fixed, known list of AEs rather than
+// sweeping the entire account. This is both faster and more accurate,
+// since we only care about capacity for reps who actually matter here.
+//   1. Every sequence owned by anyone on AE_NAMES.
+//   2. Every sequence owned by BOBBY_MOHR_NAME -- he's a template/admin
+//      owner whose sequences other real AEs enroll contacts into (e.g.
+//      "THSCA Template FB/S&C/AD 2026"), so his sequences need checking
+//      even though he's not himself an AE we're monitoring.
+//   3. Any sequence whose name contains "inbound", found via a direct
+//      Manage-list search (?q=inbound) rather than a full sweep.
+// Plus any explicitly forced IDs (FORCE_SEQUENCE_IDS).
+//
+// IMPORTANT: which AE a future email gets attributed to is NEVER based on
+// sequence ownership -- it's read per-contact from the "Enrolled ... by
+// <name>" text on each row. So even on a sequence owned by Bobby Mohr,
+// a contact enrolled by Mathew Young is correctly attributed to Mathew
+// Young. Ownership only affects which sequences we bother checking.
 //
 // For each contact we know one certain calendar date -- either their
 // enrollment's first send date (Scheduled) or their immediate next-step
@@ -28,12 +32,11 @@
 //
 // Two different tables in HubSpot's UI briefly show a "Loading" placeholder
 // before real data renders (the enrollment table's "Enrolled" column, and
-// the Manage list's own rows). We poll for real content in both places
-// rather than trusting a fixed sleep, which was previously causing rows
-// and even entire sequences to be silently dropped.
+// the Manage list's own rows). We poll for real content rather than
+// trusting a fixed sleep.
 //
 // Requires env vars: HUBSPOT_SESSION_COOKIES (JSON array), HUBSPOT_PORTAL_ID
-// Optional env vars: FORCE_SEQUENCE_IDS, ENROLLED_THRESHOLD (default 200)
+// Optional env vars: FORCE_SEQUENCE_IDS
 // Writes: ../data/scheduled.json
 
 const fs = require('fs');
@@ -42,9 +45,17 @@ const { chromium } = require('playwright');
 
 const COOKIES_JSON = process.env.HUBSPOT_SESSION_COOKIES;
 const PORTAL_ID = process.env.HUBSPOT_PORTAL_ID;
-const ENROLLED_THRESHOLD = parseInt(process.env.ENROLLED_THRESHOLD || '200', 10);
 const FORCE_SEQUENCE_IDS = (process.env.FORCE_SEQUENCE_IDS || '272570396,76707862,307480679,307295410')
   .split(',').map(s => s.trim()).filter(Boolean);
+
+const AE_NAMES = [
+  'Ben Slingerland', 'Cameron Smith', 'Daniel Kirwan', 'Ethan Barr',
+  'Fraser Campbell', 'Jack Isherwood', 'Jacob Asbill', 'Jake Pace',
+  'Jake Seymour', 'Jason Tilton', 'Jessica Brodsky', 'Maddy Haro',
+  'Mario Felix', 'Mathew Young', 'Michael Frauenheim', 'Nando Benning',
+  'Sam Boyes', 'Sean Chetcuti'
+];
+const TEMPLATE_OWNER_NAME = 'Bobby Mohr';
 
 if (!COOKIES_JSON || !PORTAL_ID) {
   console.error('Missing HUBSPOT_SESSION_COOKIES or HUBSPOT_PORTAL_ID environment variable.');
@@ -113,31 +124,6 @@ async function setPageSizeTo100(page) {
   }
 }
 
-async function getDeclaredSequenceTotal(page) {
-  try {
-    const text = await page.evaluate(() => document.body.innerText);
-    const m = text.match(/([\d,]+)\s+of\s+[\d,]+\s+created/i);
-    if (m) return parseInt(m[1].replace(/,/g, ''), 10);
-  } catch (err) {}
-  return null;
-}
-
-// Reads owner names already fetched by fetch-sent-data.js in this same job
-// run, if that file exists. Purely additive -- if missing, we just rely on
-// owner names discovered during the flat sweep instead.
-function getOwnerNamesFromSentData() {
-  try {
-    const sentPath = path.join(__dirname, '..', 'data', 'sent.json');
-    const raw = fs.readFileSync(sentPath, 'utf8');
-    const parsed = JSON.parse(raw);
-    return (parsed.owners || []).map(o => o.name).filter(Boolean);
-  } catch (err) {
-    return [];
-  }
-}
-
-// Extracts { id, name, enrolledCount } rows from whatever Manage-list page
-// is currently loaded.
 async function readManageRows(page) {
   return page.$$eval('table tbody tr', trs =>
     trs.map(tr => {
@@ -145,63 +131,32 @@ async function readManageRows(page) {
       if (!link) return null;
       const m = link.getAttribute('href').match(/\/sequence\/(\d+)/);
       if (!m) return null;
-      const cells = tr.querySelectorAll('td');
-      const enrolledText = cells[2] ? cells[2].textContent.trim() : '0';
-      const enrolledCount = parseInt(enrolledText.replace(/,/g, ''), 10) || 0;
-      const ownerName = cells[5] ? cells[5].textContent.trim() : '';
-      return { id: m[1], name: link.textContent.trim(), enrolledCount, ownerName };
+      return { id: m[1], name: link.textContent.trim() };
     }).filter(Boolean)
   );
 }
 
-// Flat sweep of the default alphabetical Manage list, up to wherever it
-// caps out. Returns matched IDs plus every distinct owner name seen.
-async function flatSweep(page) {
-  const inboundIds = [];
-  const highVolumeIds = [];
-  const ownerNames = new Set();
-  let allIds = [];
+async function searchSequencesByName(page, term) {
+  const results = [];
   let pageNum = 1;
-  let declaredTotal = null;
-  let consecutiveEmptyPages = 0;
-
   while (true) {
-    await goAndSettle(page, `https://app.hubspot.com/sequences/${PORTAL_ID}/manage?page=${pageNum}`);
-    if (declaredTotal === null) declaredTotal = await getDeclaredSequenceTotal(page);
-
-    const loaded = await waitForManageRowsToLoad(page);
+    await goAndSettle(page, `https://app.hubspot.com/sequences/${PORTAL_ID}/manage?q=${encodeURIComponent(term)}&page=${pageNum}`);
+    await waitForManageRowsToLoad(page, 5000);
     const rows = await readManageRows(page);
-
-    if (rows.length === 0) {
-      if (!loaded) {
-        consecutiveEmptyPages++;
-        if (consecutiveEmptyPages <= 2) {
-          await sleep(1500);
-          continue;
-        }
-      }
-      break;
-    }
-    consecutiveEmptyPages = 0;
-
-    rows.forEach(r => {
-      allIds.push(r.id);
-      if (r.ownerName) ownerNames.add(r.ownerName);
-      if (/inbound/i.test(r.name)) inboundIds.push(r.id);
-      if (r.enrolledCount >= ENROLLED_THRESHOLD) highVolumeIds.push(r.id);
-    });
+    if (rows.length === 0) break;
+    results.push(...rows);
+    const nextBtn = await page.$('button[aria-label="Next page"], a[aria-label="Next page"]');
+    if (!nextBtn) break;
+    const isDisabled = await nextBtn.evaluate(el => el.disabled || el.getAttribute('aria-disabled') === 'true');
+    if (isDisabled) break;
+    await nextBtn.click();
+    await sleep(1000);
     pageNum++;
-    if (pageNum > 80) break;
-    await sleep(250);
+    if (pageNum > 20) break;
   }
-
-  const uniqueSwept = new Set(allIds).size;
-  console.log(`Flat sweep found ${uniqueSwept} sequences (account reports ${declaredTotal} total).`);
-  return { inboundIds, highVolumeIds, ownerNames: [...ownerNames] };
+  return results;
 }
 
-// Looks up a rep's internal "view" ID via the Manage list's owner search,
-// then returns their sequence list's { id, name, enrolledCount } rows.
 async function sweepByOwner(page, ownerName) {
   await goAndSettle(page, `https://app.hubspot.com/sequences/${PORTAL_ID}/manage`);
 
@@ -387,37 +342,28 @@ async function main() {
     throw new Error('Session cookie appears expired -- re-export it from your browser.');
   }
 
-  console.log('Running flat sweep of Manage list...');
-  const flat = await flatSweep(page);
-  console.log(`Inbound (flat sweep): ${flat.inboundIds.length}, high-volume (flat sweep): ${flat.highVolumeIds.length}`);
+  console.log('Searching for "inbound"-named sequences...');
+  const inboundResults = await searchSequencesByName(page, 'inbound');
+  console.log(`Found ${inboundResults.length} inbound-named sequences.`);
 
-  const sentDataOwnerNames = getOwnerNamesFromSentData();
-  const allOwnerNames = [...new Set([...flat.ownerNames, ...sentDataOwnerNames])];
-  console.log(`Discovered ${allOwnerNames.length} distinct owner names to sweep individually.`);
-
-  const ownerInboundIds = [];
-  const ownerHighVolumeIds = [];
-  for (let i = 0; i < allOwnerNames.length; i++) {
-    const ownerName = allOwnerNames[i];
+  const ownersToSweep = [...AE_NAMES, TEMPLATE_OWNER_NAME];
+  const ownerSweepIds = [];
+  for (let i = 0; i < ownersToSweep.length; i++) {
+    const ownerName = ownersToSweep[i];
     try {
       const rows = await sweepByOwner(page, ownerName);
-      const inbound = rows.filter(r => /inbound/i.test(r.name)).map(r => r.id);
-      const highVol = rows.filter(r => r.enrolledCount >= ENROLLED_THRESHOLD).map(r => r.id);
-      ownerInboundIds.push(...inbound);
-      ownerHighVolumeIds.push(...highVol);
-      console.log(`  [${i + 1}/${allOwnerNames.length}] ${ownerName}: ${rows.length} sequences, ${highVol.length} high-volume`);
+      ownerSweepIds.push(...rows.map(r => r.id));
+      console.log(`  [${i + 1}/${ownersToSweep.length}] ${ownerName}: ${rows.length} sequences owned`);
     } catch (err) {
-      console.log(`  [${i + 1}/${allOwnerNames.length}] ${ownerName}: skipped (${err.message})`);
+      console.log(`  [${i + 1}/${ownersToSweep.length}] ${ownerName}: skipped (${err.message})`);
     }
     await sleep(300);
   }
 
   const sequenceIds = [...new Set([
     ...FORCE_SEQUENCE_IDS,
-    ...flat.inboundIds,
-    ...flat.highVolumeIds,
-    ...ownerInboundIds,
-    ...ownerHighVolumeIds
+    ...inboundResults.map(r => r.id),
+    ...ownerSweepIds
   ])];
   console.log(`Found ${sequenceIds.length} total sequences to check in detail.`);
 
