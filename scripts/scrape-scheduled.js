@@ -23,6 +23,13 @@
 // Email - Day 3"), we project every remaining email step's calendar date
 // by adding the business-day difference between offsets.
 //
+// IMPORTANT: the "Enrolled" column (which contains the "by <rep name>"
+// text we depend on) loads asynchronously per-row and briefly shows
+// "Loading" before resolving -- observed taking up to ~1.8s on larger
+// sequences. A fixed sleep was silently dropping every row on any
+// sequence slower than that. We now poll until "Loading" actually clears
+// (or a generous timeout elapses) before reading the table.
+//
 // Speed: each enrollment table defaults to 25 rows/page; we switch it to
 // 100/page right after loading (resets on every fresh page load, so this
 // happens once per sequence, not once ever).
@@ -53,6 +60,20 @@ async function goAndSettle(page, url) {
   await sleep(1500);
 }
 
+async function waitForEnrolledDataToLoad(page, maxWaitMs = 8000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const stillLoading = await page.evaluate(() => {
+      const rows = document.querySelectorAll('table tbody tr');
+      if (rows.length === 0) return false;
+      const text = rows[0].querySelectorAll('td')[3]?.textContent.trim() || '';
+      return text === 'Loading' || text === '';
+    });
+    if (!stillLoading) return;
+    await sleep(400);
+  }
+}
+
 function addBusinessDays(date, n) {
   const d = new Date(date);
   let added = 0;
@@ -76,6 +97,7 @@ async function setPageSizeTo100(page) {
     if (await option.count() === 0) return;
     await option.click();
     await sleep(1000);
+    await waitForEnrolledDataToLoad(page);
   } catch (err) {
     // Non-fatal -- worst case we just paginate at the default 25/page.
   }
@@ -144,6 +166,7 @@ async function getStepMap(page, sequenceId) {
 async function scrapeStatusRows(page, sequenceId, status) {
   const url = `https://app.hubspot.com/sequences/${PORTAL_ID}/sequence/${sequenceId}/enrollments/${status}?enrolledBy=ALL_USERS`;
   await goAndSettle(page, url);
+  await waitForEnrolledDataToLoad(page);
 
   const hasAnyRows = (await page.$$('table tbody tr')).length > 0;
   if (hasAnyRows) {
@@ -152,15 +175,21 @@ async function scrapeStatusRows(page, sequenceId, status) {
 
   const rows = [];
   let pageNum = 1;
+  let droppedForLoading = 0;
   while (true) {
-    const rowData = await page.$$eval('table tbody tr', (trs, statusArg) =>
-      trs.map(tr => {
+    await waitForEnrolledDataToLoad(page);
+    const pageResult = await page.$$eval('table tbody tr', (trs, statusArg) => {
+      let dropped = 0;
+      const parsed = trs.map(tr => {
         const cells = tr.querySelectorAll('td');
         if (cells.length < 8) return null;
         const enrolledText = cells[3].textContent.trim();
         const detailsText = cells[7].textContent.trim();
         const ownerMatch = enrolledText.match(/by (.+)$/);
-        if (!ownerMatch) return null;
+        if (!ownerMatch) {
+          if (enrolledText === 'Loading' || enrolledText === '') dropped++;
+          return null;
+        }
 
         if (statusArg === 'in-progress') {
           const nextStepMatch = detailsText.match(/next step on (.+)$/i);
@@ -180,9 +209,11 @@ async function scrapeStatusRows(page, sequenceId, status) {
             anchorStepNum: 1
           };
         }
-      }).filter(Boolean)
-    , status);
-    rows.push(...rowData);
+      }).filter(Boolean);
+      return { parsed, dropped };
+    }, status);
+    rows.push(...pageResult.parsed);
+    droppedForLoading += pageResult.dropped;
 
     const nextBtn = await page.$('button[aria-label="Next page"], a[aria-label="Next page"]');
     if (!nextBtn) break;
@@ -192,6 +223,9 @@ async function scrapeStatusRows(page, sequenceId, status) {
     await sleep(1000);
     pageNum++;
     if (pageNum > 200) break;
+  }
+  if (droppedForLoading > 0) {
+    console.log(`    (warning: ${droppedForLoading} row(s) still showed "Loading" after max wait and were skipped)`);
   }
   return rows;
 }
