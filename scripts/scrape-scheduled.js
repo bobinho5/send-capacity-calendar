@@ -6,13 +6,19 @@
 // already partway through ("In progress" status). HubSpot has no API for
 // this, so it's scraped from the Sequences UI using a saved session cookie.
 //
-// Which sequences get checked -- a single COMPLETE sweep of every sequence
-// in the account (paginated in the default, stable, alphabetical order --
-// NOT sorted by "Date Modified", since that value shifts constantly).
-// From that sweep we check two signals:
-//   1. Total-enrolled-ever above ENROLLED_THRESHOLD
-//   2. Name contains "inbound"
-// Plus any explicitly forced IDs (FORCE_SEQUENCE_IDS).
+// SEQUENCE DISCOVERY (three combined sources, since HubSpot's Manage list
+// hits a real pagination ceiling around ~360 of a 498-sequence account):
+//   1. A flat sweep of the default (stable, alphabetical) Manage list, up
+//      to wherever it caps out. Collects inbound-name and high-volume
+//      matches, plus every distinct owner name seen along the way.
+//   2. Owner names pulled from ../data/sent.json (written by the sibling
+//      fetch-sent-data.js script earlier in the same job).
+//   3. For every distinct owner name from (1) and (2), we look up their
+//      internal "view" ID via the Manage list's owner search box, then
+//      sweep THEIR filtered sequence list specifically. Since any single
+//      rep's sequence count is far below the pagination ceiling, this
+//      reaches sequences the flat sweep alone could never see.
+// All matches are unioned with explicitly forced IDs (FORCE_SEQUENCE_IDS).
 //
 // For each contact we know one certain calendar date -- either their
 // enrollment's first send date (Scheduled) or their immediate next-step
@@ -20,14 +26,11 @@
 // every step with a cumulative business-day offset, we project every
 // remaining email step's calendar date via business-day math.
 //
-// IMPORTANT (x2): two different tables in HubSpot's UI briefly show a
-// "Loading" placeholder before real data renders:
-//   1. The enrollment table's "Enrolled" column (the "by <rep>" text)
-//   2. The Manage list's sequence rows themselves during the sweep
-// A fixed sleep was silently treating "still loading" as "no more data"
-// in both places, causing entire sequences (and their reps' data) to be
-// dropped. We now poll for real content and cross-check the sweep's
-// final count against the account's own declared total.
+// Two different tables in HubSpot's UI briefly show a "Loading" placeholder
+// before real data renders (the enrollment table's "Enrolled" column, and
+// the Manage list's own rows). We poll for real content in both places
+// rather than trusting a fixed sleep, which was previously causing rows
+// and even entire sequences to be silently dropped.
 //
 // Requires env vars: HUBSPOT_SESSION_COOKIES (JSON array), HUBSPOT_PORTAL_ID
 // Optional env vars: FORCE_SEQUENCE_IDS, ENROLLED_THRESHOLD (default 200)
@@ -106,7 +109,7 @@ async function setPageSizeTo100(page) {
     await sleep(1000);
     await waitForEnrolledDataToLoad(page);
   } catch (err) {
-    // Non-fatal -- worst case we just paginate at the default 25/page.
+    // Non-fatal.
   }
 }
 
@@ -119,9 +122,44 @@ async function getDeclaredSequenceTotal(page) {
   return null;
 }
 
-async function getAllSequenceIds(page) {
+// Reads owner names already fetched by fetch-sent-data.js in this same job
+// run, if that file exists. Purely additive -- if missing, we just rely on
+// owner names discovered during the flat sweep instead.
+function getOwnerNamesFromSentData() {
+  try {
+    const sentPath = path.join(__dirname, '..', 'data', 'sent.json');
+    const raw = fs.readFileSync(sentPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    return (parsed.owners || []).map(o => o.name).filter(Boolean);
+  } catch (err) {
+    return [];
+  }
+}
+
+// Extracts { id, name, enrolledCount } rows from whatever Manage-list page
+// is currently loaded.
+async function readManageRows(page) {
+  return page.$$eval('table tbody tr', trs =>
+    trs.map(tr => {
+      const link = tr.querySelector('a[href*="/sequence/"]');
+      if (!link) return null;
+      const m = link.getAttribute('href').match(/\/sequence\/(\d+)/);
+      if (!m) return null;
+      const cells = tr.querySelectorAll('td');
+      const enrolledText = cells[2] ? cells[2].textContent.trim() : '0';
+      const enrolledCount = parseInt(enrolledText.replace(/,/g, ''), 10) || 0;
+      const ownerName = cells[5] ? cells[5].textContent.trim() : '';
+      return { id: m[1], name: link.textContent.trim(), enrolledCount, ownerName };
+    }).filter(Boolean)
+  );
+}
+
+// Flat sweep of the default alphabetical Manage list, up to wherever it
+// caps out. Returns matched IDs plus every distinct owner name seen.
+async function flatSweep(page) {
   const inboundIds = [];
   const highVolumeIds = [];
+  const ownerNames = new Set();
   let allIds = [];
   let pageNum = 1;
   let declaredTotal = null;
@@ -132,24 +170,12 @@ async function getAllSequenceIds(page) {
     if (declaredTotal === null) declaredTotal = await getDeclaredSequenceTotal(page);
 
     const loaded = await waitForManageRowsToLoad(page);
-    const rows = await page.$$eval('table tbody tr', trs =>
-      trs.map(tr => {
-        const link = tr.querySelector('a[href*="/sequence/"]');
-        if (!link) return null;
-        const m = link.getAttribute('href').match(/\/sequence\/(\d+)/);
-        if (!m) return null;
-        const cells = tr.querySelectorAll('td');
-        const enrolledText = cells[2] ? cells[2].textContent.trim() : '0';
-        const enrolledCount = parseInt(enrolledText.replace(/,/g, ''), 10) || 0;
-        return { id: m[1], name: link.textContent.trim(), enrolledCount };
-      }).filter(Boolean)
-    );
+    const rows = await readManageRows(page);
 
     if (rows.length === 0) {
       if (!loaded) {
         consecutiveEmptyPages++;
         if (consecutiveEmptyPages <= 2) {
-          console.log(`  page ${pageNum} loaded no rows after waiting -- retrying once...`);
           await sleep(1500);
           continue;
         }
@@ -160,6 +186,7 @@ async function getAllSequenceIds(page) {
 
     rows.forEach(r => {
       allIds.push(r.id);
+      if (r.ownerName) ownerNames.add(r.ownerName);
       if (/inbound/i.test(r.name)) inboundIds.push(r.id);
       if (r.enrolledCount >= ENROLLED_THRESHOLD) highVolumeIds.push(r.id);
     });
@@ -169,17 +196,59 @@ async function getAllSequenceIds(page) {
   }
 
   const uniqueSwept = new Set(allIds).size;
-  console.log(`Swept ${uniqueSwept} total sequences in the account.`);
-  if (declaredTotal !== null && uniqueSwept < declaredTotal * 0.9) {
-    console.log(`  WARNING: account reports ${declaredTotal} sequences total -- sweep may be incomplete.`);
+  console.log(`Flat sweep found ${uniqueSwept} sequences (account reports ${declaredTotal} total).`);
+  return { inboundIds, highVolumeIds, ownerNames: [...ownerNames] };
+}
+
+// Looks up a rep's internal "view" ID via the Manage list's owner search,
+// then returns their sequence list's { id, name, enrolledCount } rows.
+async function sweepByOwner(page, ownerName) {
+  await goAndSettle(page, `https://app.hubspot.com/sequences/${PORTAL_ID}/manage`);
+
+  const label = page.locator('label:has-text("Owner:")').first();
+  if (await label.count() === 0) return [];
+  await label.click();
+  await sleep(500);
+
+  const input = page.locator('input[placeholder="Search owner"]');
+  if (await input.count() === 0) return [];
+  await input.click();
+  await input.type(ownerName, { delay: 40 });
+
+  let hasUsersSection = false;
+  const start = Date.now();
+  while (Date.now() - start < 6000) {
+    hasUsersSection = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('body *')).some(e => e.children.length === 0 && e.textContent.trim() === 'Users')
+    );
+    if (hasUsersSection) break;
+    await sleep(500);
   }
-  console.log(`Inbound-named sequences found: ${inboundIds.length}`);
-  console.log(`High-volume sequences found (>= ${ENROLLED_THRESHOLD} total enrolled): ${highVolumeIds.length}`);
-  return [...new Set([
-    ...FORCE_SEQUENCE_IDS,
-    ...inboundIds,
-    ...highVolumeIds
-  ])];
+  if (!hasUsersSection) return [];
+
+  const resultLocator = page.locator('text=/\\d+ sequences/').first();
+  if (await resultLocator.count() === 0) return [];
+  await resultLocator.click();
+  await sleep(1200);
+
+  const rows = [];
+  let pageNum = 1;
+  while (true) {
+    await waitForManageRowsToLoad(page);
+    const pageRows = await readManageRows(page);
+    if (pageRows.length === 0) break;
+    rows.push(...pageRows);
+
+    const nextBtn = await page.$('button[aria-label="Next page"], a[aria-label="Next page"]');
+    if (!nextBtn) break;
+    const isDisabled = await nextBtn.evaluate(el => el.disabled || el.getAttribute('aria-disabled') === 'true');
+    if (isDisabled) break;
+    await nextBtn.click();
+    await sleep(1000);
+    pageNum++;
+    if (pageNum > 50) break;
+  }
+  return rows;
 }
 
 async function getStepMap(page, sequenceId) {
@@ -318,9 +387,39 @@ async function main() {
     throw new Error('Session cookie appears expired -- re-export it from your browser.');
   }
 
-  console.log('Sweeping full sequence list (stable order)...');
-  const sequenceIds = await getAllSequenceIds(page);
-  console.log(`Found ${sequenceIds.length} sequences to check in detail.`);
+  console.log('Running flat sweep of Manage list...');
+  const flat = await flatSweep(page);
+  console.log(`Inbound (flat sweep): ${flat.inboundIds.length}, high-volume (flat sweep): ${flat.highVolumeIds.length}`);
+
+  const sentDataOwnerNames = getOwnerNamesFromSentData();
+  const allOwnerNames = [...new Set([...flat.ownerNames, ...sentDataOwnerNames])];
+  console.log(`Discovered ${allOwnerNames.length} distinct owner names to sweep individually.`);
+
+  const ownerInboundIds = [];
+  const ownerHighVolumeIds = [];
+  for (let i = 0; i < allOwnerNames.length; i++) {
+    const ownerName = allOwnerNames[i];
+    try {
+      const rows = await sweepByOwner(page, ownerName);
+      const inbound = rows.filter(r => /inbound/i.test(r.name)).map(r => r.id);
+      const highVol = rows.filter(r => r.enrolledCount >= ENROLLED_THRESHOLD).map(r => r.id);
+      ownerInboundIds.push(...inbound);
+      ownerHighVolumeIds.push(...highVol);
+      console.log(`  [${i + 1}/${allOwnerNames.length}] ${ownerName}: ${rows.length} sequences, ${highVol.length} high-volume`);
+    } catch (err) {
+      console.log(`  [${i + 1}/${allOwnerNames.length}] ${ownerName}: skipped (${err.message})`);
+    }
+    await sleep(300);
+  }
+
+  const sequenceIds = [...new Set([
+    ...FORCE_SEQUENCE_IDS,
+    ...flat.inboundIds,
+    ...flat.highVolumeIds,
+    ...ownerInboundIds,
+    ...ownerHighVolumeIds
+  ])];
+  console.log(`Found ${sequenceIds.length} total sequences to check in detail.`);
 
   const finalRows = [];
   for (let i = 0; i < sequenceIds.length; i++) {
