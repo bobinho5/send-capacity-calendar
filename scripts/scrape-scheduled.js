@@ -6,13 +6,10 @@
 // already partway through ("In progress" status). HubSpot has no API for
 // this, so it's scraped from the Sequences UI using a saved session cookie.
 //
-// Which sequences get checked (union of three signals, since HubSpot's
-// Manage list can't be sorted by "currently active" directly):
+// Which sequences get checked (union of signals, since HubSpot's Manage
+// list can't be sorted by "currently active" directly):
 //   1. Top MAX_SEQUENCES most recently modified
 //   2. Any sequence with total-enrolled-ever above ENROLLED_THRESHOLD
-//      (catches large active batches that haven't been "modified"
-//      recently even though they still have a huge pending queue --
-//      this is what we were missing before)
 //   3. Any sequence whose name contains "inbound"
 //   4. Explicitly forced IDs (FORCE_SEQUENCE_IDS)
 //
@@ -22,6 +19,12 @@
 // every step with a cumulative business-day offset (e.g. "3. Automated
 // Email - Day 3"), we project every remaining email step's calendar date
 // by adding the business-day difference between offsets.
+//
+// Speed: each enrollment table defaults to 25 rows/page. We switch it to
+// 100/page right after loading (the setting isn't persisted anywhere --
+// it resets on every fresh page load -- so this has to be done per
+// sequence, but cuts a 605-contact sequence from ~25 page-clicks down to
+// ~7, which adds up significantly across a full run).
 //
 // Requires env vars: HUBSPOT_SESSION_COOKIES (JSON array), HUBSPOT_PORTAL_ID
 // Optional env vars: MAX_SEQUENCES (default 50), FORCE_SEQUENCE_IDS,
@@ -36,7 +39,7 @@ const COOKIES_JSON = process.env.HUBSPOT_SESSION_COOKIES;
 const PORTAL_ID = process.env.HUBSPOT_PORTAL_ID;
 const MAX_SEQUENCES = parseInt(process.env.MAX_SEQUENCES || '50', 10);
 const ENROLLED_THRESHOLD = parseInt(process.env.ENROLLED_THRESHOLD || '200', 10);
-const FORCE_SEQUENCE_IDS = (process.env.FORCE_SEQUENCE_IDS || '272570396,76707862')
+const FORCE_SEQUENCE_IDS = (process.env.FORCE_SEQUENCE_IDS || '272570396,76707862,307480679')
   .split(',').map(s => s.trim()).filter(Boolean);
 
 if (!COOKIES_JSON || !PORTAL_ID) {
@@ -62,6 +65,23 @@ function addBusinessDays(date, n) {
     if (dow !== 0 && dow !== 6) added++;
   }
   return d;
+}
+
+// Switches the enrollments table from the default 25/page to 100/page.
+// Resets on every fresh page load, so this must be called once per table.
+async function setPageSizeTo100(page) {
+  try {
+    const menuBtn = page.locator('button:has-text("per page")').first();
+    if (await menuBtn.count() === 0) return;
+    await menuBtn.click();
+    await sleep(400);
+    const option = page.locator('button:has-text("100 per page")').first();
+    if (await option.count() === 0) return;
+    await option.click();
+    await sleep(1000);
+  } catch (err) {
+    // Non-fatal -- worst case we just paginate at the default 25/page.
+  }
 }
 
 async function getAllSequenceIds(page) {
@@ -129,6 +149,11 @@ async function getStepMap(page, sequenceId) {
 async function scrapeStatusRows(page, sequenceId, status) {
   const url = `https://app.hubspot.com/sequences/${PORTAL_ID}/sequence/${sequenceId}/enrollments/${status}?enrolledBy=ALL_USERS`;
   await goAndSettle(page, url);
+
+  const hasAnyRows = (await page.$$('table tbody tr')).length > 0;
+  if (hasAnyRows) {
+    await setPageSizeTo100(page);
+  }
 
   const rows = [];
   let pageNum = 1;
