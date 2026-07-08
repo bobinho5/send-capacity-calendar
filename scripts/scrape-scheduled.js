@@ -8,10 +8,8 @@
 //
 // Which sequences get checked -- a single COMPLETE sweep of every sequence
 // in the account (paginated in the default, stable, alphabetical order --
-// NOT sorted by "Date Modified", since that value changes constantly as
-// sequences get enrollment activity, which was causing sequences to shift
-// position mid-pagination and silently drop out of the list entirely).
-// From that complete sweep we check two signals:
+// NOT sorted by "Date Modified", since that value shifts constantly).
+// From that sweep we check two signals:
 //   1. Total-enrolled-ever above ENROLLED_THRESHOLD
 //   2. Name contains "inbound"
 // Plus any explicitly forced IDs (FORCE_SEQUENCE_IDS).
@@ -19,20 +17,17 @@
 // For each contact we know one certain calendar date -- either their
 // enrollment's first send date (Scheduled) or their immediate next-step
 // date (In progress). Combined with the sequence's Steps tab, which labels
-// every step with a cumulative business-day offset (e.g. "3. Automated
-// Email - Day 3"), we project every remaining email step's calendar date
-// by adding the business-day difference between offsets.
+// every step with a cumulative business-day offset, we project every
+// remaining email step's calendar date via business-day math.
 //
-// IMPORTANT: the "Enrolled" column (which contains the "by <rep name>"
-// text we depend on) loads asynchronously per-row and briefly shows
-// "Loading" before resolving -- observed taking up to ~1.8s on larger
-// sequences. A fixed sleep was silently dropping every row on any
-// sequence slower than that. We now poll until "Loading" actually clears
-// (or a generous timeout elapses) before reading the table.
-//
-// Speed: each enrollment table defaults to 25 rows/page; we switch it to
-// 100/page right after loading (resets on every fresh page load, so this
-// happens once per sequence, not once ever).
+// IMPORTANT (x2): two different tables in HubSpot's UI briefly show a
+// "Loading" placeholder before real data renders:
+//   1. The enrollment table's "Enrolled" column (the "by <rep>" text)
+//   2. The Manage list's sequence rows themselves during the sweep
+// A fixed sleep was silently treating "still loading" as "no more data"
+// in both places, causing entire sequences (and their reps' data) to be
+// dropped. We now poll for real content and cross-check the sweep's
+// final count against the account's own declared total.
 //
 // Requires env vars: HUBSPOT_SESSION_COOKIES (JSON array), HUBSPOT_PORTAL_ID
 // Optional env vars: FORCE_SEQUENCE_IDS, ENROLLED_THRESHOLD (default 200)
@@ -45,7 +40,7 @@ const { chromium } = require('playwright');
 const COOKIES_JSON = process.env.HUBSPOT_SESSION_COOKIES;
 const PORTAL_ID = process.env.HUBSPOT_PORTAL_ID;
 const ENROLLED_THRESHOLD = parseInt(process.env.ENROLLED_THRESHOLD || '200', 10);
-const FORCE_SEQUENCE_IDS = (process.env.FORCE_SEQUENCE_IDS || '272570396,76707862,307480679')
+const FORCE_SEQUENCE_IDS = (process.env.FORCE_SEQUENCE_IDS || '272570396,76707862,307480679,307295410')
   .split(',').map(s => s.trim()).filter(Boolean);
 
 if (!COOKIES_JSON || !PORTAL_ID) {
@@ -72,6 +67,18 @@ async function waitForEnrolledDataToLoad(page, maxWaitMs = 8000) {
     if (!stillLoading) return;
     await sleep(400);
   }
+}
+
+async function waitForManageRowsToLoad(page, maxWaitMs = 8000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const hasLinks = await page.evaluate(() => {
+      return document.querySelectorAll('table tbody tr a[href*="/sequence/"]').length > 0;
+    });
+    if (hasLinks) return true;
+    await sleep(400);
+  }
+  return false;
 }
 
 function addBusinessDays(date, n) {
@@ -103,13 +110,28 @@ async function setPageSizeTo100(page) {
   }
 }
 
+async function getDeclaredSequenceTotal(page) {
+  try {
+    const text = await page.evaluate(() => document.body.innerText);
+    const m = text.match(/([\d,]+)\s+of\s+[\d,]+\s+created/i);
+    if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+  } catch (err) {}
+  return null;
+}
+
 async function getAllSequenceIds(page) {
   const inboundIds = [];
   const highVolumeIds = [];
   let allIds = [];
   let pageNum = 1;
+  let declaredTotal = null;
+  let consecutiveEmptyPages = 0;
+
   while (true) {
     await goAndSettle(page, `https://app.hubspot.com/sequences/${PORTAL_ID}/manage?page=${pageNum}`);
+    if (declaredTotal === null) declaredTotal = await getDeclaredSequenceTotal(page);
+
+    const loaded = await waitForManageRowsToLoad(page);
     const rows = await page.$$eval('table tbody tr', trs =>
       trs.map(tr => {
         const link = tr.querySelector('a[href*="/sequence/"]');
@@ -122,7 +144,20 @@ async function getAllSequenceIds(page) {
         return { id: m[1], name: link.textContent.trim(), enrolledCount };
       }).filter(Boolean)
     );
-    if (rows.length === 0) break;
+
+    if (rows.length === 0) {
+      if (!loaded) {
+        consecutiveEmptyPages++;
+        if (consecutiveEmptyPages <= 2) {
+          console.log(`  page ${pageNum} loaded no rows after waiting -- retrying once...`);
+          await sleep(1500);
+          continue;
+        }
+      }
+      break;
+    }
+    consecutiveEmptyPages = 0;
+
     rows.forEach(r => {
       allIds.push(r.id);
       if (/inbound/i.test(r.name)) inboundIds.push(r.id);
@@ -132,7 +167,12 @@ async function getAllSequenceIds(page) {
     if (pageNum > 80) break;
     await sleep(250);
   }
-  console.log(`Swept ${allIds.length} total sequences in the account.`);
+
+  const uniqueSwept = new Set(allIds).size;
+  console.log(`Swept ${uniqueSwept} total sequences in the account.`);
+  if (declaredTotal !== null && uniqueSwept < declaredTotal * 0.9) {
+    console.log(`  WARNING: account reports ${declaredTotal} sequences total -- sweep may be incomplete.`);
+  }
   console.log(`Inbound-named sequences found: ${inboundIds.length}`);
   console.log(`High-volume sequences found (>= ${ENROLLED_THRESHOLD} total enrolled): ${highVolumeIds.length}`);
   return [...new Set([
