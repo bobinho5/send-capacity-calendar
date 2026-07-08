@@ -6,6 +6,16 @@
 // already partway through ("In progress" status). HubSpot has no API for
 // this, so it's scraped from the Sequences UI using a saved session cookie.
 //
+// Which sequences get checked (union of three signals, since HubSpot's
+// Manage list can't be sorted by "currently active" directly):
+//   1. Top MAX_SEQUENCES most recently modified
+//   2. Any sequence with total-enrolled-ever above ENROLLED_THRESHOLD
+//      (catches large active batches that haven't been "modified"
+//      recently even though they still have a huge pending queue --
+//      this is what we were missing before)
+//   3. Any sequence whose name contains "inbound"
+//   4. Explicitly forced IDs (FORCE_SEQUENCE_IDS)
+//
 // For each contact we know one certain calendar date -- either their
 // enrollment's first send date (Scheduled) or their immediate next-step
 // date (In progress). Combined with the sequence's Steps tab, which labels
@@ -14,8 +24,8 @@
 // by adding the business-day difference between offsets.
 //
 // Requires env vars: HUBSPOT_SESSION_COOKIES (JSON array), HUBSPOT_PORTAL_ID
-// Optional env vars: MAX_SEQUENCES (default 50), FORCE_SEQUENCE_IDS
-//   (comma-separated sequence IDs to always include regardless of ranking)
+// Optional env vars: MAX_SEQUENCES (default 50), FORCE_SEQUENCE_IDS,
+//   ENROLLED_THRESHOLD (default 200)
 // Writes: ../data/scheduled.json
 
 const fs = require('fs');
@@ -25,6 +35,7 @@ const { chromium } = require('playwright');
 const COOKIES_JSON = process.env.HUBSPOT_SESSION_COOKIES;
 const PORTAL_ID = process.env.HUBSPOT_PORTAL_ID;
 const MAX_SEQUENCES = parseInt(process.env.MAX_SEQUENCES || '50', 10);
+const ENROLLED_THRESHOLD = parseInt(process.env.ENROLLED_THRESHOLD || '200', 10);
 const FORCE_SEQUENCE_IDS = (process.env.FORCE_SEQUENCE_IDS || '272570396,76707862')
   .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -56,20 +67,28 @@ function addBusinessDays(date, n) {
 async function getAllSequenceIds(page) {
   const topIds = [];
   const inboundIds = [];
+  const highVolumeIds = [];
   let doneCollectingTop = false;
   let pageNum = 1;
   while (true) {
     await goAndSettle(page, `https://app.hubspot.com/sequences/${PORTAL_ID}/manage?field=updated_at&order=DESC&page=${pageNum}`);
-    const rows = await page.$$eval('a[href*="/sequence/"]', as =>
-      as.map(a => {
-        const m = a.getAttribute('href').match(/\/sequence\/(\d+)/);
-        return m ? { id: m[1], name: a.textContent.trim() } : null;
+    const rows = await page.$$eval('table tbody tr', trs =>
+      trs.map(tr => {
+        const link = tr.querySelector('a[href*="/sequence/"]');
+        if (!link) return null;
+        const m = link.getAttribute('href').match(/\/sequence\/(\d+)/);
+        if (!m) return null;
+        const cells = tr.querySelectorAll('td');
+        const enrolledText = cells[2] ? cells[2].textContent.trim() : '0';
+        const enrolledCount = parseInt(enrolledText.replace(/,/g, ''), 10) || 0;
+        return { id: m[1], name: link.textContent.trim(), enrolledCount };
       }).filter(Boolean)
     );
     if (rows.length === 0) break;
     rows.forEach(r => {
       if (!doneCollectingTop) topIds.push(r.id);
       if (/inbound/i.test(r.name)) inboundIds.push(r.id);
+      if (r.enrolledCount >= ENROLLED_THRESHOLD) highVolumeIds.push(r.id);
     });
     if (topIds.length >= MAX_SEQUENCES) doneCollectingTop = true;
     pageNum++;
@@ -77,10 +96,12 @@ async function getAllSequenceIds(page) {
     await sleep(300);
   }
   console.log(`Inbound-named sequences found: ${inboundIds.length}`);
+  console.log(`High-volume sequences found (>= ${ENROLLED_THRESHOLD} total enrolled): ${highVolumeIds.length}`);
   return [...new Set([
     ...topIds.slice(0, MAX_SEQUENCES),
     ...FORCE_SEQUENCE_IDS,
-    ...inboundIds
+    ...inboundIds,
+    ...highVolumeIds
   ])];
 }
 
@@ -105,11 +126,6 @@ async function getStepMap(page, sequenceId) {
   return stepMap;
 }
 
-// Scrapes one enrollment-status tab ("in-progress" or "scheduled") for a
-// sequence. The two statuses have different row layouts:
-//   - in-progress: Details cell reads "Step 2 of 3 / next step on Jul 8, 2026"
-//   - scheduled:   Details cell reads "Starts in a day / on Jul 9, 2026"
-//     (contact hasn't started the sequence yet -- this date is for step 1)
 async function scrapeStatusRows(page, sequenceId, status) {
   const url = `https://app.hubspot.com/sequences/${PORTAL_ID}/sequence/${sequenceId}/enrollments/${status}?enrolledBy=ALL_USERS`;
   await goAndSettle(page, url);
@@ -153,7 +169,7 @@ async function scrapeStatusRows(page, sequenceId, status) {
     const isDisabled = await nextBtn.evaluate(el => el.disabled || el.getAttribute('aria-disabled') === 'true');
     if (isDisabled) break;
     await nextBtn.click();
-    await sleep(900);
+    await sleep(1000);
     pageNum++;
     if (pageNum > 200) break;
   }
@@ -210,7 +226,7 @@ async function main() {
 
   console.log('Listing sequences...');
   const sequenceIds = await getAllSequenceIds(page);
-  console.log(`Found ${sequenceIds.length} sequences to check (including forced: ${FORCE_SEQUENCE_IDS.join(', ')}, plus any "inbound"-named sequences).`);
+  console.log(`Found ${sequenceIds.length} sequences to check.`);
 
   const finalRows = [];
   for (let i = 0; i < sequenceIds.length; i++) {
