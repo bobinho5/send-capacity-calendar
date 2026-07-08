@@ -1,13 +1,17 @@
 // scrape-scheduled.js
 //
-// Pulls forward-looking projected email-send dates for in-progress sequence
-// enrollments. HubSpot has no API for this, so it's scraped from the
-// Sequences UI using a saved session cookie.
+// Pulls forward-looking projected email-send dates for sequence enrollments
+// that either haven't started yet ("Scheduled" status -- bulk-enrolled
+// contacts HubSpot is staggering to respect daily send limits) or are
+// already partway through ("In progress" status). HubSpot has no API for
+// this, so it's scraped from the Sequences UI using a saved session cookie.
 //
-// This version projects the FULL remaining chain of email steps for each
-// contact (not just the immediate next step), always includes a fixed list
-// of "must check" sequences, and always includes any sequence whose name
-// contains "inbound" regardless of how recently it was modified.
+// For each contact we know one certain calendar date -- either their
+// enrollment's first send date (Scheduled) or their immediate next-step
+// date (In progress). Combined with the sequence's Steps tab, which labels
+// every step with a cumulative business-day offset (e.g. "3. Automated
+// Email - Day 3"), we project every remaining email step's calendar date
+// by adding the business-day difference between offsets.
 //
 // Requires env vars: HUBSPOT_SESSION_COOKIES (JSON array), HUBSPOT_PORTAL_ID
 // Optional env vars: MAX_SEQUENCES (default 50), FORCE_SEQUENCE_IDS
@@ -101,31 +105,47 @@ async function getStepMap(page, sequenceId) {
   return stepMap;
 }
 
-async function scrapeEnrollmentRows(page, sequenceId) {
-  const url = `https://app.hubspot.com/sequences/${PORTAL_ID}/sequence/${sequenceId}/enrollments/in-progress?enrolledBy=ALL_USERS`;
+// Scrapes one enrollment-status tab ("in-progress" or "scheduled") for a
+// sequence. The two statuses have different row layouts:
+//   - in-progress: Details cell reads "Step 2 of 3 / next step on Jul 8, 2026"
+//   - scheduled:   Details cell reads "Starts in a day / on Jul 9, 2026"
+//     (contact hasn't started the sequence yet -- this date is for step 1)
+async function scrapeStatusRows(page, sequenceId, status) {
+  const url = `https://app.hubspot.com/sequences/${PORTAL_ID}/sequence/${sequenceId}/enrollments/${status}?enrolledBy=ALL_USERS`;
   await goAndSettle(page, url);
 
   const rows = [];
   let pageNum = 1;
   while (true) {
-    const rowData = await page.$$eval('table tbody tr', trs =>
+    const rowData = await page.$$eval('table tbody tr', (trs, statusArg) =>
       trs.map(tr => {
         const cells = tr.querySelectorAll('td');
         if (cells.length < 8) return null;
         const enrolledText = cells[3].textContent.trim();
         const detailsText = cells[7].textContent.trim();
         const ownerMatch = enrolledText.match(/by (.+)$/);
-        const nextStepMatch = detailsText.match(/next step on (.+)$/i);
-        const stepCountMatch = detailsText.match(/Step (\d+) of (\d+)/i);
-        if (!ownerMatch || !nextStepMatch || !stepCountMatch) return null;
-        return {
-          repName: ownerMatch[1].trim(),
-          nextStepText: nextStepMatch[1].trim(),
-          nextStepNum: parseInt(stepCountMatch[1], 10),
-          totalSteps: parseInt(stepCountMatch[2], 10)
-        };
+        if (!ownerMatch) return null;
+
+        if (statusArg === 'in-progress') {
+          const nextStepMatch = detailsText.match(/next step on (.+)$/i);
+          const stepCountMatch = detailsText.match(/Step (\d+) of (\d+)/i);
+          if (!nextStepMatch || !stepCountMatch) return null;
+          return {
+            repName: ownerMatch[1].trim(),
+            anchorDateText: nextStepMatch[1].trim(),
+            anchorStepNum: parseInt(stepCountMatch[1], 10)
+          };
+        } else {
+          const dateMatch = detailsText.match(/on\s+(.+)$/i);
+          if (!dateMatch) return null;
+          return {
+            repName: ownerMatch[1].trim(),
+            anchorDateText: dateMatch[1].trim(),
+            anchorStepNum: 1
+          };
+        }
       }).filter(Boolean)
-    );
+    , status);
     rows.push(...rowData);
 
     const nextBtn = await page.$('button[aria-label="Next page"], a[aria-label="Next page"]');
@@ -141,14 +161,15 @@ async function scrapeEnrollmentRows(page, sequenceId) {
 }
 
 function projectEmailDates(contactRow, stepMap) {
-  const { nextStepNum, totalSteps, nextStepText } = contactRow;
-  const anchorDate = new Date(nextStepText);
+  const { anchorStepNum, anchorDateText } = contactRow;
+  const anchorDate = new Date(anchorDateText);
   if (isNaN(anchorDate.getTime())) return [];
-  const anchorStep = stepMap[nextStepNum];
+  const anchorStep = stepMap[anchorStepNum];
   if (!anchorStep) return [];
 
+  const totalSteps = Math.max(...Object.keys(stepMap).map(Number));
   const dates = [];
-  for (let j = nextStepNum; j <= totalSteps; j++) {
+  for (let j = anchorStepNum; j <= totalSteps; j++) {
     const step = stepMap[j];
     if (!step || !step.isEmail) continue;
     const dayDiff = step.dayOffset - anchorStep.dayOffset;
@@ -196,22 +217,25 @@ async function main() {
     const id = sequenceIds[i];
     try {
       console.log(`[${i + 1}/${sequenceIds.length}] Checking sequence ${id}...`);
-      const enrollmentRows = await scrapeEnrollmentRows(page, id);
-      if (enrollmentRows.length === 0) {
-        console.log('  -> 0 in-progress enrollments, skipping step map fetch');
+      const inProgressRows = await scrapeStatusRows(page, id, 'in-progress');
+      const scheduledRows = await scrapeStatusRows(page, id, 'scheduled');
+      const allRows = [...inProgressRows, ...scheduledRows];
+
+      if (allRows.length === 0) {
+        console.log('  -> 0 enrollments in progress or scheduled, skipping step map fetch');
         continue;
       }
-      console.log(`  -> ${enrollmentRows.length} in-progress enrollments, fetching step map...`);
+      console.log(`  -> ${inProgressRows.length} in-progress, ${scheduledRows.length} scheduled-not-started, fetching step map...`);
       const stepMap = await getStepMap(page, id);
       let projectedCount = 0;
-      enrollmentRows.forEach(row => {
+      allRows.forEach(row => {
         const dates = projectEmailDates(row, stepMap);
         dates.forEach(sendDate => {
           finalRows.push({ repName: row.repName, sendDate });
           projectedCount++;
         });
       });
-      console.log(`  -> projected ${projectedCount} future email sends across remaining steps`);
+      console.log(`  -> projected ${projectedCount} future email sends`);
     } catch (err) {
       console.log(`  -> skipped (${err.message})`);
     }
