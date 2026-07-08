@@ -169,8 +169,20 @@ function isFutureKey(key){ return key > todayKey(); }
 function normalizeName(s){ return (s||'').toString().trim().toLowerCase().replace(/\s+/g,' '); }
 
 function countFor(ownerId, key){
-  const source = isFutureKey(key) ? state.scheduledSends : state.sends;
-  const o = source[ownerId];
+  const tKey = todayKey();
+  if(key < tKey){
+    const o = state.sends[ownerId];
+    return (o && o[key]) || 0;
+  }
+  if(key === tKey){
+    // Today is a mix: some already sent (live data), some still queued to
+    // fire later today (scheduled data) -- combine both so today's total
+    // isn't an undercount.
+    const sentToday = (state.sends[ownerId] && state.sends[ownerId][key]) || 0;
+    const scheduledToday = (state.scheduledSends[ownerId] && state.scheduledSends[ownerId][key]) || 0;
+    return sentToday + scheduledToday;
+  }
+  const o = state.scheduledSends[ownerId];
   return (o && o[key]) || 0;
 }
 
