@@ -6,12 +6,15 @@
 // already partway through ("In progress" status). HubSpot has no API for
 // this, so it's scraped from the Sequences UI using a saved session cookie.
 //
-// Which sequences get checked (union of signals, since HubSpot's Manage
-// list can't be sorted by "currently active" directly):
-//   1. Top MAX_SEQUENCES most recently modified
-//   2. Any sequence with total-enrolled-ever above ENROLLED_THRESHOLD
-//   3. Any sequence whose name contains "inbound"
-//   4. Explicitly forced IDs (FORCE_SEQUENCE_IDS)
+// Which sequences get checked -- a single COMPLETE sweep of every sequence
+// in the account (paginated in the default, stable, alphabetical order --
+// NOT sorted by "Date Modified", since that value changes constantly as
+// sequences get enrollment activity, which was causing sequences to shift
+// position mid-pagination and silently drop out of the list entirely).
+// From that complete sweep we check two signals:
+//   1. Total-enrolled-ever above ENROLLED_THRESHOLD
+//   2. Name contains "inbound"
+// Plus any explicitly forced IDs (FORCE_SEQUENCE_IDS).
 //
 // For each contact we know one certain calendar date -- either their
 // enrollment's first send date (Scheduled) or their immediate next-step
@@ -20,15 +23,12 @@
 // Email - Day 3"), we project every remaining email step's calendar date
 // by adding the business-day difference between offsets.
 //
-// Speed: each enrollment table defaults to 25 rows/page. We switch it to
-// 100/page right after loading (the setting isn't persisted anywhere --
-// it resets on every fresh page load -- so this has to be done per
-// sequence, but cuts a 605-contact sequence from ~25 page-clicks down to
-// ~7, which adds up significantly across a full run).
+// Speed: each enrollment table defaults to 25 rows/page; we switch it to
+// 100/page right after loading (resets on every fresh page load, so this
+// happens once per sequence, not once ever).
 //
 // Requires env vars: HUBSPOT_SESSION_COOKIES (JSON array), HUBSPOT_PORTAL_ID
-// Optional env vars: MAX_SEQUENCES (default 50), FORCE_SEQUENCE_IDS,
-//   ENROLLED_THRESHOLD (default 200)
+// Optional env vars: FORCE_SEQUENCE_IDS, ENROLLED_THRESHOLD (default 200)
 // Writes: ../data/scheduled.json
 
 const fs = require('fs');
@@ -37,7 +37,6 @@ const { chromium } = require('playwright');
 
 const COOKIES_JSON = process.env.HUBSPOT_SESSION_COOKIES;
 const PORTAL_ID = process.env.HUBSPOT_PORTAL_ID;
-const MAX_SEQUENCES = parseInt(process.env.MAX_SEQUENCES || '50', 10);
 const ENROLLED_THRESHOLD = parseInt(process.env.ENROLLED_THRESHOLD || '200', 10);
 const FORCE_SEQUENCE_IDS = (process.env.FORCE_SEQUENCE_IDS || '272570396,76707862,307480679')
   .split(',').map(s => s.trim()).filter(Boolean);
@@ -67,8 +66,6 @@ function addBusinessDays(date, n) {
   return d;
 }
 
-// Switches the enrollments table from the default 25/page to 100/page.
-// Resets on every fresh page load, so this must be called once per table.
 async function setPageSizeTo100(page) {
   try {
     const menuBtn = page.locator('button:has-text("per page")').first();
@@ -85,13 +82,12 @@ async function setPageSizeTo100(page) {
 }
 
 async function getAllSequenceIds(page) {
-  const topIds = [];
   const inboundIds = [];
   const highVolumeIds = [];
-  let doneCollectingTop = false;
+  let allIds = [];
   let pageNum = 1;
   while (true) {
-    await goAndSettle(page, `https://app.hubspot.com/sequences/${PORTAL_ID}/manage?field=updated_at&order=DESC&page=${pageNum}`);
+    await goAndSettle(page, `https://app.hubspot.com/sequences/${PORTAL_ID}/manage?page=${pageNum}`);
     const rows = await page.$$eval('table tbody tr', trs =>
       trs.map(tr => {
         const link = tr.querySelector('a[href*="/sequence/"]');
@@ -106,19 +102,18 @@ async function getAllSequenceIds(page) {
     );
     if (rows.length === 0) break;
     rows.forEach(r => {
-      if (!doneCollectingTop) topIds.push(r.id);
+      allIds.push(r.id);
       if (/inbound/i.test(r.name)) inboundIds.push(r.id);
       if (r.enrolledCount >= ENROLLED_THRESHOLD) highVolumeIds.push(r.id);
     });
-    if (topIds.length >= MAX_SEQUENCES) doneCollectingTop = true;
     pageNum++;
-    if (pageNum > 50) break;
-    await sleep(300);
+    if (pageNum > 80) break;
+    await sleep(250);
   }
+  console.log(`Swept ${allIds.length} total sequences in the account.`);
   console.log(`Inbound-named sequences found: ${inboundIds.length}`);
   console.log(`High-volume sequences found (>= ${ENROLLED_THRESHOLD} total enrolled): ${highVolumeIds.length}`);
   return [...new Set([
-    ...topIds.slice(0, MAX_SEQUENCES),
     ...FORCE_SEQUENCE_IDS,
     ...inboundIds,
     ...highVolumeIds
@@ -249,9 +244,9 @@ async function main() {
     throw new Error('Session cookie appears expired -- re-export it from your browser.');
   }
 
-  console.log('Listing sequences...');
+  console.log('Sweeping full sequence list (stable order)...');
   const sequenceIds = await getAllSequenceIds(page);
-  console.log(`Found ${sequenceIds.length} sequences to check.`);
+  console.log(`Found ${sequenceIds.length} sequences to check in detail.`);
 
   const finalRows = [];
   for (let i = 0; i < sequenceIds.length; i++) {
