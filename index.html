@@ -366,7 +366,18 @@ async function loadData(){
   try{
     const sentRes = await fetch('./data/sent.json', { cache: 'no-store' });
     const sent = await sentRes.json();
-    state.owners = (sent.owners || []).sort((a, b) => a.name.localeCompare(b.name));
+    const EXCLUDED_OWNER_NAMES = [
+      'Brian', 'Buddy', 'Cameron Smith', 'Conor', 'Elliot', 'Dylan', 'Finlay',
+      'Hallam', 'Hannah', 'Jack Coventry', 'James', 'Jarmila', 'Karlie',
+      'Kevin', 'Luke', 'Mia', 'Patrick', 'Sarah'
+    ];
+    const isExcludedOwner = (fullName) => EXCLUDED_OWNER_NAMES.some(ex =>
+      ex.includes(' ') ? normalizeName(fullName) === normalizeName(ex)
+                        : normalizeName(fullName).split(' ')[0] === normalizeName(ex)
+    );
+    state.owners = (sent.owners || [])
+      .filter(o => !isExcludedOwner(o.name))
+      .sort((a, b) => a.name.localeCompare(b.name));
     state.sends = sent.sends || {};
     state.sentMeta = { generatedAt: sent.generatedAt };
   } catch(err){ console.error('Could not load sent.json', err); }
